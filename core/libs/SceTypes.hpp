@@ -1236,7 +1236,7 @@ union NetCtlInfo { std::uint8_t opaque[256]; };
 
 using NetCtlCallback = void (*)(int, void*);
 
-struct HttpEpoll {};
+struct HttpEpoll;
 using HttpEpollHandle = HttpEpoll*;
 using HttpsCallback = int (*)(int, unsigned int, void* const*, int, void*);
 using HttpRedirectCallback = int (*)(int, std::int32_t, std::int32_t*, const char*, void*);
