@@ -1,16 +1,21 @@
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 #include <cstdint>
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceHttp/src/HttpEpoll.hpp"
 #include "prx/libSceHttp/src/HttpErrors.hpp"
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
-#include <thread>
 
 // No network is emulated: contexts, templates and requests can be created, but any request
 // that would touch the network fails with the library's network error.
@@ -22,6 +27,72 @@ struct RequestStatusRegistration {
 };
 static std::mutex g_statusMutex;
 static std::map<int, RequestStatusRegistration> g_statusCallbacks;
+
+namespace {
+
+#ifdef _WIN32
+struct HostMutex {
+    SRWLOCK native = SRWLOCK_INIT;
+
+    HostMutex() = default;
+    HostMutex(const HostMutex&) = delete;
+    HostMutex& operator=(const HostMutex&) = delete;
+
+    void lock() { AcquireSRWLockExclusive(&native); }
+    void unlock() { ReleaseSRWLockExclusive(&native); }
+};
+#else
+using HostMutex = std::mutex;
+#endif
+
+class HostCondition {
+public:
+    HostCondition() = default;
+    HostCondition(const HostCondition&) = delete;
+    HostCondition& operator=(const HostCondition&) = delete;
+
+    void NotifyAll() {
+#ifdef _WIN32
+        WakeAllConditionVariable(&native);
+#else
+        native.notify_all();
+#endif
+    }
+
+    void Wait(std::unique_lock<HostMutex>& lock) {
+#ifdef _WIN32
+        if (!SleepConditionVariableSRW(&native, &lock.mutex()->native, INFINITE, 0))
+            throw std::runtime_error("libSceHttp: native condition wait failed");
+#else
+        native.wait(lock);
+#endif
+    }
+
+    void WaitUntil(std::unique_lock<HostMutex>& lock, std::chrono::steady_clock::time_point deadline) {
+#ifdef _WIN32
+        const auto now = std::chrono::steady_clock::now();
+        if (deadline <= now) return;
+        const auto milliseconds = std::chrono::ceil<std::chrono::milliseconds>(deadline - now).count();
+        if (!SleepConditionVariableSRW(&native, &lock.mutex()->native, static_cast<DWORD>(milliseconds), 0) &&
+            GetLastError() != ERROR_TIMEOUT)
+            throw std::runtime_error("libSceHttp: native condition wait failed");
+#else
+        native.wait_until(lock, deadline);
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    CONDITION_VARIABLE native = CONDITION_VARIABLE_INIT;
+#else
+    std::condition_variable native;
+#endif
+};
+
+HostMutex g_epollMutex;
+HostCondition g_epollCondition;
+
+}
 
 extern "C" {
 
@@ -103,6 +174,11 @@ int APS5_VABI sceHttpDeleteTemplate(int tmpl_id) {
 
 int APS5_VABI sceHttpDestroyEpoll(int http_ctx_id, HttpEpollHandle eh) {
     (void)http_ctx_id;
+    if (eh) {
+        std::unique_lock lock(g_epollMutex);
+        if (eh->waiters > 0 && !eh->aborted) NotImplemented_nid_no_patch(__func__);
+        while (eh->waiters > 0) g_epollCondition.Wait(lock);
+    }
     delete eh;
     return 0;
 }
@@ -259,9 +335,20 @@ int APS5_VABI sceHttpUnsetEpoll(int id) {
 
 int APS5_VABI sceHttpWaitRequest(HttpEpollHandle eh, HttpNBEvent* nbev, int maxevents, int timeout) {
     if (!eh || !nbev || maxevents <= 0) return ERROR_INVALID_VALUE;
+    std::unique_lock lock(g_epollMutex);
+    if (eh->aborted) return ERROR_ABORTED;
     if (timeout < 0) NotImplemented_nid_no_patch(__func__);
-    std::this_thread::sleep_for(std::chrono::microseconds(timeout));
-    return 0;
+    if (timeout == 0) return 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout);
+    ++eh->waiters;
+    while (!eh->aborted && std::chrono::steady_clock::now() < deadline) {
+        g_epollCondition.WaitUntil(lock, deadline);
+    }
+    const bool aborted = eh->aborted;
+    const bool last = --eh->waiters == 0;
+    lock.unlock();
+    if (aborted && last) g_epollCondition.NotifyAll();
+    return aborted ? ERROR_ABORTED : 0;
 }
 
 int APS5_VABI sceHttpCreateRequestWithURL(int conn_id, int method, const char* url, uint64_t content_length) {
@@ -434,8 +521,13 @@ int APS5_VABI sceHttpSetRedirectCallback(int id, HttpRedirectCallback cbfunc, vo
     return 0;
 }
 
-int APS5_VABI sceHttpAbortWaitRequest(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceHttpAbortWaitRequest(HttpEpollHandle eh) {
+    if (!eh) return ERROR_INVALID_VALUE;
+    {
+        std::lock_guard lock(g_epollMutex);
+        eh->aborted = true;
+    }
+    g_epollCondition.NotifyAll();
     return 0;
 }
 }

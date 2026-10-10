@@ -1,9 +1,14 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libSceHttp/src/HttpEpoll.hpp"
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
 extern "C" {
 int APS5_VABI sceHttpUriParse(SceHttpUriElement*, const char*, void*, std::size_t*, std::size_t);
@@ -18,6 +23,7 @@ int APS5_VABI sceHttpUriSweepPath(char*, const char*, std::size_t);
 int APS5_VABI sceHttpCreateEpoll(int, HttpEpollHandle*);
 int APS5_VABI sceHttpDestroyEpoll(int, HttpEpollHandle);
 int APS5_VABI sceHttpWaitRequest(HttpEpollHandle, HttpNBEvent*, int, int);
+int APS5_VABI sceHttpAbortWaitRequest(HttpEpollHandle);
 int APS5_VABI sceHttpReadData(int, void*, std::size_t);
 int APS5_VABI sceHttpCreateRequest2(int, const char*, const char*, std::uint64_t);
 int APS5_VABI sceHttpsEnableOption(int, std::uint32_t);
@@ -42,6 +48,82 @@ static bool Equal(const char* left, const char* right) { return std::strcmp(left
 static int AuthInfo(int, int, const char*, char*, char*, int, std::uint8_t**, std::uint64_t*, int*, void*) { std::abort(); }
 static void APS5_VABI RequestStatusCallback(int, int, void* argument) {
     ++*static_cast<int*>(argument);
+}
+
+constexpr int kHttpAborted = static_cast<int>(0x80431080);
+constexpr int kWaitThreads = 4;
+constexpr int kSafetyTimeoutUs = 20000000;
+
+static void AwaitWaiters(HttpEpollHandle epoll, int count) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(kSafetyTimeoutUs);
+    while (epoll->waiters.load() != count) {
+        Require(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::yield();
+    }
+}
+
+static std::vector<std::thread> StartWaiters(HttpEpollHandle epoll, int* results, int timeout) {
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kWaitThreads; ++i) {
+        threads.emplace_back([epoll, results, i, timeout] {
+            HttpNBEvent events[1]{};
+            results[i] = sceHttpWaitRequest(epoll, events, 1, timeout);
+        });
+    }
+    AwaitWaiters(epoll, kWaitThreads);
+    return threads;
+}
+
+static void JoinAborted(std::vector<std::thread>& threads, const int* results) {
+    for (auto& thread : threads) thread.join();
+    for (int i = 0; i < kWaitThreads; ++i) Require(results[i] == kHttpAborted);
+}
+
+static void TestAbortWaitRequest() {
+    constexpr int invalidValue = static_cast<int>(0x804311FE);
+    Require(sceHttpAbortWaitRequest(nullptr) == invalidValue);
+
+    HttpEpollHandle epoll = nullptr;
+    HttpEpollHandle other = nullptr;
+    Require(sceHttpCreateEpoll(1, &epoll) == 0);
+    Require(sceHttpCreateEpoll(1, &other) == 0);
+    int results[kWaitThreads]{};
+    auto threads = StartWaiters(epoll, results, kSafetyTimeoutUs);
+    Require(sceHttpAbortWaitRequest(epoll) == 0);
+    JoinAborted(threads, results);
+
+    HttpNBEvent events[1]{};
+    Require(sceHttpWaitRequest(epoll, events, 1, 0) == kHttpAborted);
+    Require(sceHttpWaitRequest(epoll, events, 1, kSafetyTimeoutUs) == kHttpAborted);
+    Require(sceHttpWaitRequest(epoll, events, 1, -1) == kHttpAborted);
+    Require(sceHttpAbortWaitRequest(epoll) == 0);
+    Require(sceHttpDestroyEpoll(1, epoll) == 0);
+
+    const auto start = std::chrono::steady_clock::now();
+    Require(sceHttpWaitRequest(other, events, 1, 1000) == 0);
+    Require(std::chrono::steady_clock::now() - start >= std::chrono::microseconds(1000));
+
+    threads = StartWaiters(other, results, kSafetyTimeoutUs);
+    bool threw = false;
+    try {
+        sceHttpDestroyEpoll(1, other);
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw);
+    Require(sceHttpAbortWaitRequest(other) == 0);
+    JoinAborted(threads, results);
+    Require(sceHttpDestroyEpoll(1, other) == 0);
+
+    for (int iteration = 0; iteration < 200; ++iteration) {
+        HttpEpollHandle raced = nullptr;
+        Require(sceHttpCreateEpoll(1, &raced) == 0);
+        int raceResults[kWaitThreads]{};
+        auto waiters = StartWaiters(raced, raceResults, kSafetyTimeoutUs);
+        Require(sceHttpAbortWaitRequest(raced) == 0);
+        Require(sceHttpDestroyEpoll(1, raced) == 0);
+        JoinAborted(waiters, raceResults);
+    }
 }
 
 int main() {
@@ -209,6 +291,7 @@ int main() {
     Require(sceHttpWaitRequest(epoll, events, 0, 0) == invalidValue);
     Require(sceHttpWaitRequest(nullptr, events, 2, 0) == invalidValue);
     Require(sceHttpDestroyEpoll(1, epoll) == 0);
+    TestAbortWaitRequest();
 
     char data[16];
     Require(sceHttpReadData(1, data, sizeof(data)) == network);
