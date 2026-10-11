@@ -431,9 +431,13 @@ void Run(AgcDriver::VulkanDevice& device, const Row& row, const GuestBlock& gues
     compute.scratchDwords = ScratchDwords;
     auto request = MakeRequest(device, codeSpan, memory, userData, compute, row.waveSize);
     request.useCache = false;
+    const auto compileStart = std::chrono::steady_clock::now();
     const auto result = ShaderRecompiler::Recompile(request);
+    const auto dispatchStart = std::chrono::steady_clock::now();
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(codeSpan.data()));
     device.WaitIdle();
+    const auto dispatchEnd = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "[phase] %s recompile %.2f s dispatch+wait %.2f s\n", Describe(row).c_str(), std::chrono::duration<double>(dispatchStart - compileStart).count(), std::chrono::duration<double>(dispatchEnd - dispatchStart).count());
     if (wideAtomic) {
         Check64(row, output);
     } else {
@@ -500,13 +504,14 @@ int main(int argc, char** argv) {
         GuestBlock guest;
         std::size_t checked = 0;
         const auto rows = Rows();
+        for (int pass = 0; pass < 2; ++pass)
         for (std::size_t index = part; index < rows.size(); index += parts) {
             const Row& row = rows[index];
             if (row.waveSize == 64u && !wave64) continue;
             if (row.atomic && row.width == 64u && !int64Atomics) continue;
             const auto rowStart = std::chrono::steady_clock::now();
             Run(*device, row, guest);
-            std::fprintf(stderr, "[rowtime] part %zu row %zu %s wave%u %.2f s\n", part, index, Describe(row).c_str(), row.waveSize, std::chrono::duration<double>(std::chrono::steady_clock::now() - rowStart).count());
+            std::fprintf(stderr, "[rowtime] pass %d part %zu row %zu %s wave%u %.2f s\n", pass, part, index, Describe(row).c_str(), row.waveSize, std::chrono::duration<double>(std::chrono::steady_clock::now() - rowStart).count());
             ++checked;
         }
         if (!wave64) std::printf("skipped the wave64 rows, subgroup size %u cannot hold a wave64 in two lanes\n", device->Target().subgroupSize);
