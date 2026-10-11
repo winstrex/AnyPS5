@@ -17,6 +17,8 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <chrono>
+#include <cstdio>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -502,14 +504,16 @@ int main(int argc, char** argv) {
             const Row& row = rows[index];
             if (row.waveSize == 64u && !wave64) continue;
             if (row.atomic && row.width == 64u && !int64Atomics) continue;
+            const auto rowStart = std::chrono::steady_clock::now();
             Run(*device, row, guest);
+            std::fprintf(stderr, "[rowtime] part %zu row %zu %s wave%u %.2f s\n", part, index, Describe(row).c_str(), row.waveSize, std::chrono::duration<double>(std::chrono::steady_clock::now() - rowStart).count());
             ++checked;
         }
         if (!wave64) std::printf("skipped the wave64 rows, subgroup size %u cannot hold a wave64 in two lanes\n", device->Target().subgroupSize);
         if (!int64Atomics) std::puts("skipped the 64-bit atomic rows, the device has no shaderBufferInt64Atomics");
         std::printf("flat aperture rows checked: %zu\n", checked);
         std::puts("flat aperture tests passed");
-        return 0;
+        return 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
