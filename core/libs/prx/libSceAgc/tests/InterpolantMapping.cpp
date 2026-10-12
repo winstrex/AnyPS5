@@ -14,6 +14,7 @@
 extern "C" int APS5_VABI sceAgcCreateInterpolantMapping_0100(ShaderRegister* regs, const Shader* gs, const Shader* ps);
 extern "C" int APS5_VABI sceAgcUnknownCreateInterpolantMapping(ShaderRegister* regs, const Shader* gs, const Shader* ps);
 extern "C" int APS5_VABI sceAgcUnknown_vieBRwlh1Lw(ShaderRegister* regs, const Shader* gs, const Shader* ps);
+extern "C" int APS5_VABI sceAgcUpdateInterpolantMapping_0100(ShaderRegister* regs, const Shader* vs, const Shader* ps);
 
 namespace {
 
@@ -167,6 +168,75 @@ void testUpdateMapping() {
     }
 }
 
+void testUpdateInterpolantMapping() {
+    std::array<ShaderSemantic, 5> inputs{
+        semantic(1, 0, 2), semantic(2, 0, 2), semantic(5, 0, 2), semantic(3, 0, 0), semantic(4, 0, 3)};
+    inputs[0].is_flat_shaded = 1;
+    inputs[0].default_value = 1;
+    inputs[0].default_value_hi = 3;
+    inputs[1].default_value_hi = 1;
+    inputs[2].is_flat_shaded = 1;
+    inputs[2].default_value_hi = 2;
+    inputs[3].is_flat_shaded = 1;
+    inputs[3].default_value = 2;
+    std::array<ShaderSemantic, 4> outputs{semantic(1, 7, 3), semantic(2, 4, 1), semantic(3, 9, 0), semantic(4, 2, 1)};
+    Shader vs{};
+    vs.output_semantics = outputs.data();
+    vs.num_output_semantics = static_cast<std::uint16_t>(outputs.size());
+    Shader ps{};
+    ps.input_semantics = inputs.data();
+    ps.num_input_semantics = static_cast<std::uint32_t>(inputs.size());
+
+    auto update = filled();
+    const auto untouched = filled();
+    const std::size_t written = inputs.size() * sizeof(ShaderRegister);
+    check(sceAgcUpdateInterpolantMapping_0100(update.data(), &vs, &ps) == 0, "interpolant mapping update failed");
+    check(preparedCount == inputs.size(), "interpolant mapping update prepared registers past its inputs");
+    check(std::memcmp(update.data(), preparedMapping.data(), written) == 0, "prepared interpolant mapping update differs from published registers");
+    for (std::uint32_t i = 0; i < inputs.size(); ++i) {
+        check(update[i].offset == ShaderRegs::SPI_PS_INPUT_CNTL_0 + i, "interpolant mapping update register offset changed");
+    }
+    check(update[0].value == 0x02680527u, "matched high f16 half is not mapped as an f16 input");
+    check(update[1].value == 0x02380024u, "high f16 half with an unmatched half does not use its defaults");
+    check(update[2].value == 0x02580020u, "unmatched high f16 half does not use its defaults");
+    check(update[3].value == 0x00000609u, "32-bit interpolant mapping update changed");
+    check(update[4].value == 0x03180002u, "full f16 interpolant mapping update changed");
+    check(std::memcmp(update.data() + inputs.size(), untouched.data(), sizeof(update) - written) == 0, "interpolant mapping update wrote past its inputs");
+
+    auto created = filled();
+    check(sceAgcCreateInterpolantMapping_0100(created.data(), &vs, &ps) == 0, "mapping failed");
+    check(std::memcmp(created.data(), update.data(), written) == 0, "interpolant mapping update differs from the created mapping");
+
+    std::array<ShaderSemantic, 3> defaults{semantic(2, 0, 1), semantic(6, 0, 3), semantic(7, 0, 0)};
+    defaults[0].default_value_hi = 1;
+    defaults[1].default_value = 2;
+    defaults[1].default_value_hi = 1;
+    defaults[2].is_custom = 1;
+    defaults[2].default_value = 3;
+    std::array<ShaderSemantic, 1> defaultOutputs{semantic(2, 7, 1)};
+    vs.output_semantics = defaultOutputs.data();
+    vs.num_output_semantics = static_cast<std::uint16_t>(defaultOutputs.size());
+    ps.input_semantics = defaults.data();
+    ps.num_input_semantics = static_cast<std::uint32_t>(defaults.size());
+    update = filled();
+    check(sceAgcUpdateInterpolantMapping_0100(update.data(), &vs, &ps) == 0, "f16 inputs with different low and high defaults were rejected");
+    check(update[0].value == 0x01380007u, "matched low f16 half does not keep its own low and high defaults");
+    check(update[1].value == 0x03380220u, "unmatched full f16 input does not keep its own low and high defaults");
+    check(update[2].value == 0x00000320u, "unmatched custom 32-bit input changed");
+
+    Shader empty{};
+    update = filled();
+    check(sceAgcUpdateInterpolantMapping_0100(update.data(), nullptr, &empty) == 0, "interpolant mapping update without inputs failed");
+    check(preparedCount == 0u, "interpolant mapping update without inputs prepared registers");
+    check(std::memcmp(update.data(), untouched.data(), sizeof(update)) == 0, "interpolant mapping update without inputs wrote registers");
+
+    ps.input_semantics = inputs.data();
+    ps.num_input_semantics = static_cast<std::uint32_t>(inputs.size());
+    expectFailure([&] { sceAgcUpdateInterpolantMapping_0100(nullptr, &vs, &ps); });
+    expectFailure([&] { sceAgcUpdateInterpolantMapping_0100(update.data(), &vs, nullptr); });
+    expectFailure([&] { sceAgcUpdateInterpolantMapping_0100(update.data(), nullptr, &ps); });
+}
+
 void testRejections() {
     std::array<ShaderSemantic, 33> inputs{};
     Shader gs{};
@@ -208,8 +278,9 @@ int main() {
         testIdentity();
         testMapping();
         testUpdateMapping();
+        testUpdateInterpolantMapping();
         testRejections();
-        check(mappings == 7u && links == 5u, "mapping preparation call count changed");
+        check(mappings == 11u && links == 8u, "mapping preparation call count changed");
         LibcRunShutdown_nid_postfix();
         std::puts("AGC interpolant mapping tests passed");
         return 0;
