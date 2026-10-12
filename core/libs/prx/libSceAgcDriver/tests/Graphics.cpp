@@ -1718,7 +1718,11 @@ void cmaskTests() {
     queue.context[0x324] = 0;
     queue.context[0x3b8] = 0x0dc00000u;
     const auto target = DecodeColorBuffer(queue.context, 0);
-    Require(target.cmaskAddress == cmaskAddress && target.cmaskBytes == cmaskMemory.size(), "the fast-clear target lost its CMASK");
+    Require(target.cmaskAddress == 0 && !target.cmaskFastClear, "a single-sample FAST_CLEAR target decoded a CMASK");
+    auto multisampled = queue;
+    multisampled.context[0x31d] = 0x9000;
+    const auto fastCleared = DecodeColorBuffer(multisampled.context, 0);
+    Require(fastCleared.cmaskAddress == cmaskAddress && fastCleared.cmaskFastClear, "the multisampled fast-clear target lost its CMASK");
     std::vector<AgcDriver::Graphics::RegisterRead> log;
     AgcDriver::Graphics::RegisterReadLog() = &log;
     static_cast<void>(DecodeColorBuffer(queue.context, 0));
@@ -1728,28 +1732,18 @@ void cmaskTests() {
     Require(DecodeColorBuffer(makeState().context, 0).cmaskAddress == 0, "a target without FAST_CLEAR got a CMASK");
     using AgcDriver::Graphics::CmaskBytes;
     Require(CmaskBytes(1920, 1080) == 0x6000 && CmaskBytes(960, 544) == 0x2000 && CmaskBytes(800, 450) == 0x1000 && CmaskBytes(1024, 512) == 0x1000 && CmaskBytes(3840, 2160) == 0x14000, "a CMASK does not span whole 1024x512 metablocks");
-    auto mipmapped = queue;
-    mipmapped.context[0x3b0] |= 1u << 28u;
-    expectFailure([&] { DecodeColorBuffer(mipmapped.context, 0); }, "mipmapped, 3D or array");
-    auto unaddressed = queue;
-    unaddressed.context[0x31f] = 0;
-    unaddressed.context[0x398] = 0;
-    expectFailure([&] { DecodeColorBuffer(unaddressed.context, 0); }, "without a CMASK address");
-    auto unaligned = queue;
+    auto unaligned = multisampled;
     unaligned.context[0x3b8] = 0x09c00000u;
     expectFailure([&] { DecodeColorBuffer(unaligned.context, 0); }, "pipe-aligned SW_64KB_Z_X");
     unaligned.context[0x3b8] = 0x0d000000u;
     expectFailure([&] { DecodeColorBuffer(unaligned.context, 0); }, "pipe-aligned SW_64KB_Z_X");
-    unaligned = queue;
-    unaligned.context[0x31f] += 1u;
-    expectFailure([&] { DecodeColorBuffer(unaligned.context, 0); }, "misaligned");
     using AgcDriver::Graphics::CmaskLayout;
     Require(CmaskBytes(61, 13) == CmaskLayout(61, 13).Bytes() && CmaskBytes(3840, 2160) == CmaskLayout(3840, 2160).Bytes(), "the CMASK size and layout disagree");
 
     queue.context[0x0] = 0;
     queue.context[0x202] = 0xcc0020;
     auto pass = AgcDriver::Graphics::DecodeColorMetadataPass(queue);
-    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == cmaskAddress, "the metadata pass lost the target's CMASK");
+    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == 0, "the metadata pass decoded a CMASK for a single-sample target");
     const AgcDriver::Graphics::Context context{};
     const auto texels = [&](std::uint32_t value) {
         for (std::size_t offset = 0; offset < colorMemory.size(); offset += 4) {
@@ -1762,6 +1756,10 @@ void cmaskTests() {
     const auto cmaskIs = [&](std::uint8_t value) { return std::all_of(cmaskMemory.begin(), cmaskMemory.end(), [&](std::uint8_t byte) { return byte == value; }); };
     std::memset(colorMemory.data(), 0x5a, colorMemory.size());
     cmaskMemory.fill(0);
+    AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
+    Require(texels(0x5a5a5a5au) && cmaskIs(0), "an eliminate pass over a single-sample FAST_CLEAR target used the memory CB_COLOR0_CMASK points at");
+    pass->targets[0].cmaskAddress = cmaskAddress;
+    pass->targets[0].cmaskBytes = cmaskMemory.size();
     AgcDriver::Graphics::RunColorMetadataPass(context, *pass);
     Require(texels(0x11223344) && cmaskIs(0xff), "a CMASK fast clear was not eliminated into the texels");
     std::memset(colorMemory.data(), 0x5a, colorMemory.size());
@@ -1810,7 +1808,9 @@ void cmaskTests() {
     queue.context[0x325] = static_cast<std::uint32_t>(keysAddress >> 8u);
     queue.context[0x3a8] = static_cast<std::uint32_t>(keysAddress >> 40u);
     pass = AgcDriver::Graphics::DecodeColorMetadataPass(queue);
-    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == cmaskAddress && pass->targets[0].dccAddress == keysAddress, "a DCC fast-clear target lost its CMASK or DCC keys");
+    Require(pass.has_value() && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == 0 && pass->targets[0].dccAddress == keysAddress, "a single-sample DCC fast-clear target decoded a CMASK or lost its DCC keys");
+    pass->targets[0].cmaskAddress = cmaskAddress;
+    pass->targets[0].cmaskBytes = cmaskMemory.size();
     std::memset(colorMemory.data(), 0x5a, colorMemory.size());
     cmaskMemory.fill(0xff);
     dccKeys.fill(0x20);
@@ -2032,7 +2032,8 @@ void multisampleTests() {
     queue.context[0x3b9] = queue.context[0x3b8];
     queue.context[0x32b] = queue.context[0x31c] | 0x2000u;
     setCmaskAddress(queue, 1);
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "fast-clear color target");
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::Resolve && pass->targets.size() == 1 && pass->targets[0].cmaskAddress == 0, "a CB resolve into a single-sample FAST_CLEAR target did not decode without a CMASK");
     queue = multisampled();
     queue.context[0x2f8] = 0;
     queue.context[0x0] = 0;
