@@ -1,3 +1,4 @@
+#include "prx/libc/include/HostEntropy.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -8,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <random>
 #include <stdexcept>
 #include <string>
 #ifdef _WIN32
@@ -161,11 +161,7 @@ int APS5_VABI sysctl_nid_postfix(const int* name, std::uint32_t nameLength, void
         }
         if (oldLength == nullptr) return 0;
         const std::size_t count = std::min(*oldLength, static_cast<std::size_t>(256));
-        if (oldValue != nullptr) {
-            static std::random_device device;
-            auto* bytes = static_cast<std::uint8_t*>(oldValue);
-            for (std::size_t i = 0; i < count; ++i) bytes[i] = static_cast<std::uint8_t>(device());
-        }
+        if (oldValue != nullptr) HostEntropy_nid_no_patch(oldValue, count);
         *oldLength = count;
         return 0;
     }
@@ -197,9 +193,7 @@ int APS5_VABI sysctlbyname_nid_postfix(const char* name, void* oldValue, std::si
             return -1;
         }
         if (oldValue == nullptr || oldLength == nullptr) throw std::runtime_error(std::string(__func__) + ": kern.rng_pseudo without an output buffer");
-        static std::random_device device;
-        auto* bytes = static_cast<std::uint8_t*>(oldValue);
-        for (std::size_t i = 0; i < *oldLength; ++i) bytes[i] = static_cast<std::uint8_t>(device());
+        HostEntropy_nid_no_patch(oldValue, *oldLength);
         return 0;
     }
     if (std::strcmp(name, "kern.sdk_version") == 0) {
