@@ -114,6 +114,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ComputePipelineCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
@@ -137,6 +138,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/FrameCaptureSession.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferCopy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
@@ -229,7 +231,7 @@ add_custom_target(agc_trace_revision
         VERBATIM
 )
 set(agcZlibIncludeDir ${CMAKE_SOURCE_DIR}/3rdparty/libjpeg-turbo/src/spng/zlib)
-set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp PROPERTIES
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameCapture.cpp PROPERTIES
         INCLUDE_DIRECTORIES ${agcZlibIncludeDir}
 )
 
@@ -302,6 +304,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_stack_walk PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_stack_walk PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_frame_capture_tests tests/FrameCapture.cpp Execution/src/FrameCapture.cpp)
+    target_include_directories(agc_frame_capture_tests PRIVATE ${LIBS_INCLUDE_DIR} ${agcZlibIncludeDir})
+    target_link_libraries(agc_frame_capture_tests PRIVATE libc jpeg_turbo)
+    configure_windows_unwind(agc_frame_capture_tests)
+    add_test(NAME agc_frame_capture COMMAND agc_frame_capture_tests)
+    set_tests_properties(agc_frame_capture PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_frame_capture PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 

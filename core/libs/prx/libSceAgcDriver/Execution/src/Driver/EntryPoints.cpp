@@ -1,11 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/FrameCaptureSession.hpp"
 #include <mutex>
 
 namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
-    DriverDetail::Driver::Get().Submit(packet, queue);
+    const auto forward = [&] { DriverDetail::Driver::Get().Submit(packet, queue); };
+    if (auto* capture = DriverDetail::ActiveFrameCapture()) capture->Submit({queue, reinterpret_cast<std::uint64_t>(packet->addr), packet->dw_num, packet->flags}, forward);
+    else forward();
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -20,10 +23,13 @@ void Shutdown() {
 
 void RegisterShader(const Shader* shader) {
     DriverDetail::Driver::Get().RegisterShader(shader);
+    if (auto* capture = DriverDetail::ActiveFrameCapture()) capture->Preparation(DriverDetail::CapturedShader(shader));
 }
 
 void SuspendPoint() {
-    DriverDetail::Driver::Get().SuspendPoint();
+    const auto forward = [] { DriverDetail::Driver::Get().SuspendPoint(); };
+    if (auto* capture = DriverDetail::ActiveFrameCapture()) capture->Suspend(forward);
+    else forward();
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
@@ -39,11 +45,15 @@ void AttachWindow(const PresentationWindow& window) {
 }
 
 void PresentClear(const PresentationWindow& window, bool opaque, void (*gpuReady)(void*), void* context) {
-    DriverDetail::Driver::Get().Present(window, nullptr, opaque, gpuReady, context);
+    const auto forward = [&] { DriverDetail::Driver::Get().Present(window, nullptr, opaque, gpuReady, context); };
+    if (auto* capture = DriverDetail::ActiveFrameCapture()) capture->Present({false, opaque, {}}, forward);
+    else forward();
 }
 
 void PresentBuffer(const PresentationWindow& window, const DisplayBuffer& buffer, void (*gpuReady)(void*), void* context) {
-    DriverDetail::Driver::Get().Present(window, &buffer, true, gpuReady, context);
+    const auto forward = [&] { DriverDetail::Driver::Get().Present(window, &buffer, true, gpuReady, context); };
+    if (auto* capture = DriverDetail::ActiveFrameCapture()) capture->Present({true, true, buffer}, forward);
+    else forward();
 }
 
 void ReleaseWindow(void* window) {
@@ -125,17 +135,24 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+    if (auto* capture = AgcDriver::DriverDetail::ActiveFrameCapture()) capture->Preparation(AgcDriver::FrameCaptureShaderAbi{reinterpret_cast<std::uint64_t>(shader), {context.begin(), context.end()}, {primitive.begin(), primitive.end()}});
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    if (auto* capture = AgcDriver::DriverDetail::ActiveFrameCapture()) capture->Preparation(AgcDriver::FrameCaptureGraphicsAbi{reinterpret_cast<std::uint64_t>(vertex), reinterpret_cast<std::uint64_t>(pixel), primitiveType});
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+    if (auto* capture = AgcDriver::DriverDetail::ActiveFrameCapture()) {
+        AgcDriver::FrameCaptureGraphicsStagesAbi record{{}, {context.begin(), context.end()}, {primitive.begin(), primitive.end()}};
+        for (const auto* stage : stages) record.stages.push_back(reinterpret_cast<std::uint64_t>(stage));
+        capture->Preparation(std::move(record));
+    }
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
