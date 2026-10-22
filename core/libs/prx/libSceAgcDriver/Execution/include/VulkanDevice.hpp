@@ -241,6 +241,7 @@ public:
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
     double FinishPresent();
     void QueuePresent();
+    bool PresentsOnOwnQueue() const;
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
     // APS5_PROFILE_DRAW, how many in flight have not signaled (the frame record's batches_at_flip).
     void FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const;

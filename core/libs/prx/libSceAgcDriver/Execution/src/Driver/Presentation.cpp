@@ -77,6 +77,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         bool submitted = false;
         bool presentable = false;
         bool trailing = false;
+        bool queueUnlocked = false;
         double waitedMs = 0;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
@@ -125,11 +126,19 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             }
             if (submitted && (syncFlip || inFlight != 0)) {
 
-                presenting->QueuePresent();
-                timing.Mark("queue_present");
+                if (presenting->PresentsOnOwnQueue()) {
+                    queueUnlocked = true;
+                } else {
+                    presenting->QueuePresent();
+                    timing.Mark("queue_present");
+                }
                 trailing = !syncFlip;
                 submitted = false;
             }
+        }
+        if (queueUnlocked) {
+            presenting->QueuePresent();
+            timing.Mark("queue_present");
         }
         if (trailing) {
             waitedMs += presenting->FinishPresent();
@@ -139,9 +148,13 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             waitedMs = presenting->FinishPresent();
             timing.Mark("render_fence_wait");
 
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
-            std::lock_guard lock(GuestMemory::GpuMutex());
-            presenting->QueuePresent();
+            if (presenting->PresentsOnOwnQueue()) {
+                presenting->QueuePresent();
+            } else {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
+                std::lock_guard lock(GuestMemory::GpuMutex());
+                presenting->QueuePresent();
+            }
             timing.Mark("queue_present");
         }
         gpuReady(context);
