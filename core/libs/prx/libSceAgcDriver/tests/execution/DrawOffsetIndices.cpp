@@ -1,9 +1,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -13,6 +24,7 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -288,6 +300,37 @@ alignas(256) constexpr std::array<std::uint16_t, 4> Indices{2, 0, 1, 0};
 alignas(256) constexpr std::array<std::uint16_t, 4> RaisedIndices{5, 3, 4, 0};
 alignas(256) constexpr std::array<std::uint16_t, 4> RestartIndices{0xffff, 5, 3, 4};
 
+constexpr std::size_t WatchedBytes = 65536;
+
+void* AllocateWatched() {
+    if (!AgcDriver::GuestMemory::WriteWatched()) return nullptr;
+#ifdef _WIN32
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(WatchedBytes, WatchedBytes);
+    GuestArena::GuestArenaCommit_nid_postfix(block, WatchedBytes, PAGE_READWRITE, WatchedBytes);
+#else
+    void* raw = mmap(nullptr, WatchedBytes * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (raw == MAP_FAILED) throw std::runtime_error("cannot map the watched index block");
+    const auto begin = reinterpret_cast<std::uintptr_t>(raw);
+    const auto aligned = (begin + WatchedBytes - 1) & ~static_cast<std::uintptr_t>(WatchedBytes - 1);
+    if (aligned != begin) munmap(raw, aligned - begin);
+    if (aligned + WatchedBytes != begin + WatchedBytes * 2) munmap(reinterpret_cast<void*>(aligned + WatchedBytes), begin + WatchedBytes - aligned);
+    void* block = reinterpret_cast<void*>(aligned);
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, WatchedBytes);
+#endif
+    if (!AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uint64_t>(block), WatchedBytes)) throw std::runtime_error("the watched index block is not watched");
+    return block;
+}
+
+void ReleaseWatched(void* block) {
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(block, WatchedBytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, WatchedBytes);
+#else
+    munmap(block, WatchedBytes);
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, WatchedBytes);
+#endif
+}
+
 std::array<std::uint32_t, 4> SlotDescriptor(const void* data, std::uint32_t records) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), records, 0x01014facu};
@@ -533,10 +576,14 @@ std::string Run(Fixture& fixture) {
         fixture.Draw(vertex, draw, true);
         failures += fixture.Check("direct indexed strip that starts with a restart index, lowest index 3, s16 1000, s17 40", raised, baseVertex, startInstance, true);
     }
-    {
+    if (void* watched = AllocateWatched()) {
+        struct Release {
+            void* block;
+            ~Release() { ReleaseWatched(block); }
+        } release{watched};
         constexpr std::uint32_t baseVertex = 1000;
         constexpr std::uint32_t startInstance = 40;
-        auto* guestIndices = reinterpret_cast<std::uint16_t*>(fixture.Records() + 256);
+        auto* guestIndices = static_cast<std::uint16_t*>(watched);
         std::copy(RaisedIndices.begin(), RaisedIndices.end(), guestIndices);
         const auto userData = fixture.UserData(baseVertex, startInstance);
         const auto vertex = fixture.Vertex(VertexCode, userData);
@@ -545,8 +592,10 @@ std::string Run(Fixture& fixture) {
         for (const auto* pass : {"first", "second"}) {
             fixture.Place(baseVertex, raised, startInstance);
             fixture.Draw(vertex, draw);
-            failures += fixture.Check(std::string("indexed draw from guest memory whose lowest index is 3, s16 1000, s17 40, ") + pass + " time", raised, baseVertex, startInstance, true);
+            failures += fixture.Check(std::string("indexed draw from write-watched indices whose lowest index is 3, s16 1000, s17 40, ") + pass + " time", raised, baseVertex, startInstance, true);
         }
+    } else {
+        std::cout << "write watching unavailable: indices kept between draws not tested\n";
     }
 
     const auto staleUserData = fixture.UserData(0x51u, 0x62u);
