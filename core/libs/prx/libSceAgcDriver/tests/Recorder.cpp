@@ -4437,6 +4437,56 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
     const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
     Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
+    const auto window = address + 32768;
+    const auto sameAsGuest = [&](const DrawInputCopy& copy, std::size_t from, std::size_t to) { return copy.buffer->Bytes().size() >= to && std::memcmp(copy.buffer->Bytes().data() + from, reinterpret_cast<const void*>(window + from), to - from) == 0; };
+    const auto tail = CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex, 8192);
+    Require(!tail.reused && tail.from == 8192 && tail.buffer->Bytes().size() == 16384 && sameAsGuest(tail, 8192, 16384), "a vertex window copy is wrong");
+    KeepDrawInput(&recorder, window, tail, Use::Vertex, 0);
+    Require(CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex, 8192).buffer == tail.buffer, "the same vertex window was copied again");
+    Require(CopyDrawInput(context, &recorder, window, 12288, 1, Use::Vertex, 9216).buffer == tail.buffer, "a vertex window inside the kept one was copied again");
+    words[(32768 + 1024) / 4] = 0x1234;
+    Require(CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex, 8192).reused, "a store below a vertex window made its snapshot stale");
+    words[(32768 + 13312) / 4] = 0x5678;
+    const auto lower = CopyDrawInput(context, &recorder, window, 12288, 1, Use::Vertex, 4096);
+    Require(lower.reused && lower.buffer == tail.buffer && sameAsGuest(lower, 4096, 12288), "a vertex window below the kept one was not filled in from the guest");
+    const auto past = CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex, 8192);
+    Require(!past.reused && sameAsGuest(past, 8192, 16384), "filling in a vertex window hid a store past the read that filled it");
+    KeepDrawInput(&recorder, window, past, Use::Vertex, 0);
+    const auto below = CopyDrawInput(context, &recorder, window, 4096, 1, Use::Vertex, 1024);
+    Require(!below.reused && below.buffer != past.buffer && sameAsGuest(below, 1024, 4096), "a read below a vertex window was served by its snapshot");
+    Require(CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex, 8192).buffer == past.buffer, "a read below a vertex window dropped its snapshot");
+    const auto filled = CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex);
+    Require(filled.reused && filled.buffer == past.buffer && sameAsGuest(filled, 0, 16384), "a whole read did not fill in the kept vertex window from the guest");
+    Require(CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex, 4096).buffer == past.buffer, "a filled-in vertex window was copied again");
+    words[(32768 + 5120) / 4] = 0x9abc;
+    const auto refilled = CopyDrawInput(context, &recorder, window, 16384, 1, Use::Vertex, 4096);
+    Require(!refilled.reused && sameAsGuest(refilled, 4096, 16384), "a store in a filled-in vertex window was not seen");
+    bool refused = false;
+    try {
+        CopyDrawInput(context, &recorder, window, 256, 4, Use::Index32, 4);
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("only a vertex input starts past its address") != std::string_view::npos;
+        if (!refused) throw;
+    }
+    Require(refused, "an index copy started past its address");
+    refused = false;
+    try {
+        CopyDrawInput(context, &recorder, window, 256, 1, Use::Vertex, 256);
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("only a vertex input starts past its address") != std::string_view::npos;
+        if (!refused) throw;
+    }
+    Require(refused, "a vertex window started at its end");
+    const auto indices = CopyDrawInput(context, &recorder, window + 24576, 256, 4, Use::Index32);
+    KeepDrawInput(&recorder, window + 24576, indices, Use::Index32, 9, 7);
+    const auto keptIndices = CopyDrawInput(context, &recorder, window + 24576, 256, 4, Use::Index32);
+    Require(keptIndices.reused && keptIndices.derived == 9 && keptIndices.lowest == 7, "a kept index copy lost its lowest index");
+    const auto rangeAddress = window + 28672;
+    const auto rangeGeneration = CollectWrites(rangeAddress, 4096);
+    recorder.KeepHighestIndex(rangeAddress, 4096, Use::Index16, rangeGeneration, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), 9u, 4u);
+    std::optional<std::uint32_t> rangeHighest;
+    std::uint32_t rangeLowest = 0;
+    Require(recorder.KnownHighestIndex(rangeAddress, 4096, Use::Index16, rangeHighest, &rangeLowest) && rangeHighest == 9u && rangeLowest == 4u, "a kept index range lost its lowest index");
     recorder.Sync();
 }
 
@@ -4519,9 +4569,9 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
     first[2] = 0xffff;
     std::memcpy(reinterpret_cast<void*>(indices), first.data(), kept * 2);
     auto range = InPlaceIndexRange(recorder, indices, kept, 2, false);
-    Require(!range.reused && range.highest == 0xffffu, "an in-place index range was not scanned at its first use");
+    Require(!range.reused && range.highest == 0xffffu && range.lowest == 1u, "an in-place index range was not scanned at its first use");
     range = InPlaceIndexRange(recorder, indices, kept, 2, false);
-    Require(range.reused && range.highest == 0xffffu, "an unchanged in-place index range was scanned again");
+    Require(range.reused && range.highest == 0xffffu && range.lowest == 1u, "an unchanged in-place index range was scanned again");
     range = InPlaceIndexRange(recorder, indices, kept, 2, true);
     Require(!range.reused && range.highest == 9u, "an in-place index range served a scan made under the other restart rule");
     Require(!InPlaceIndexRange(recorder, indices, kept + 2, 2, true).reused, "an in-place index range served a scan of another size");
@@ -4540,7 +4590,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
     Require(!InPlaceIndexRange(recorder, indices, kept * 2 - 4, 4, false).reused, "a 32-bit in-place index range below the kept size was kept");
     Require(!InPlaceIndexRange(recorder, indices, kept * 2, 4, false).reused, "a 32-bit in-place index range was not scanned at its first use");
     range = InPlaceIndexRange(recorder, indices, kept * 2, 4, false);
-    Require(range.reused && range.highest == 0x000c0003u, "an unchanged 32-bit in-place index range was scanned again");
+    Require(range.reused && range.highest == 0x000c0003u && range.lowest == 0x00010001u, "an unchanged 32-bit in-place index range was scanned again");
     const std::vector<std::uint16_t> restarts(Recorder::KeptIndexRangeIndices, 0xffff);
     std::memcpy(reinterpret_cast<void*>(indices + 20480), restarts.data(), kept);
     Require(!InPlaceIndexRange(recorder, indices + 20480, kept, 2, true).highest.has_value(), "an index range of restart indices has a highest index");
@@ -10413,6 +10463,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--draw-inputs-in-place-only") {
             drawInputInPlaceTests(device, recorder);
             std::cout << "In-place draw input tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-input-reuse-only") {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
+            drawInputReuseTests(device, recorder);
+            std::cout << "Draw input reuse tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-inputs-copied-only") {
