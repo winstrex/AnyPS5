@@ -29,6 +29,7 @@ bool gdsWritesPending(std::span<const std::uint32_t> packet, const VulkanDevice*
     const auto bytes = static_cast<std::size_t>(Pm4::DmaBytes(packet));
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
     if (Graphics::Recorder::SnapshotWriteOverlaps(address, bytes) || Graphics::StorageTexture::AnyPendingOverlaps(range) || Graphics::AnyShadowedOverlaps(address, bytes)) return true;
+    if (DrawPipeline::Queue0().Overlaps(address, bytes)) return true;
     if (localDevice == nullptr || !Pm4::GdsImportable()) return false;
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     return localDevice->StoresPendingOver(address, bytes);
