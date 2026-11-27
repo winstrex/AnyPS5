@@ -623,6 +623,7 @@ public:
     static std::uint64_t PublishGeneration();
     // labels waiting in completion actions (the CPU must reap their batch for them to land);
     static std::uint64_t PendingCompletionLabels();
+    static void SetGpuProgressHook(void (*hook)());
     static std::uint64_t PendingCompletionStores();
     // write-back completions (OnComplete) of unfinished batches: a reaper retires them when every
     // worker sleeps, as for the labels above;

@@ -161,6 +161,21 @@ Driver& Driver::Get() {
     return driver;
 }
 
+void Driver::ReapAfterGpuProgress() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+    auto& driver = Get();
+    while (completionsPending()) {
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+        if (gpuLock.owns_lock()) {
+            driver.bumpEpoch(&EpochBumps::reaps);
+            if (const auto localDevice = driver.device.Load()) localDevice->ReapRecorded();
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return;
+        std::this_thread::yield();
+    }
+}
+
 Driver::~Driver() {
     GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
@@ -279,6 +294,7 @@ void Driver::stop() {
 Driver::Driver() {
     startProfileDumps();
     InstallAsyncLog_nid_no_patch();
+    Graphics::Recorder::SetGpuProgressHook(&Driver::ReapAfterGpuProgress);
     static const bool driverMemory = (MapDriverMemory(), true);
     static_cast<void>(driverMemory);
     LibcSetExitDrain_nid_no_patch([] {

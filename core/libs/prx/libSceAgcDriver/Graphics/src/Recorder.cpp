@@ -1345,6 +1345,14 @@ void TeardownCheckpointMarkers() noexcept {
     state = CheckpointMarkerDevice{};
 }
 
+namespace {
+std::atomic<void (*)()> gpuProgressHook{nullptr};
+}
+
+void Recorder::SetGpuProgressHook(void (*hook)()) {
+    gpuProgressHook.store(hook, std::memory_order_release);
+}
+
 struct Recorder::ProgressWatcher {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<bool> stop{false};
@@ -1377,6 +1385,7 @@ struct Recorder::ProgressWatcher {
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
                 KernelWakeSleepers_nid_no_patch();
+                if (const auto hook = gpuProgressHook.load(std::memory_order_acquire); hook != nullptr && (completionLabels.load(std::memory_order_acquire) != 0 || writeBackCompletions.load(std::memory_order_acquire) != 0)) hook();
             }
         });
     }
