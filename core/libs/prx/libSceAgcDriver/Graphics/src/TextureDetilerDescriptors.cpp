@@ -13,6 +13,7 @@ void TextureDetiler::BeginBatch() {
     resetRing(descriptorSets, "vkResetDescriptorPool texture detiler");
     resetRing(cmaskDescriptorSets, "vkResetDescriptorPool CMASK clear");
     resetRing(imageDescriptorSets, "vkResetDescriptorPool texture detiler");
+    resetRing(readbackDescriptorSets, "vkResetDescriptorPool multisample readback");
 }
 
 void TextureDetiler::resetRing(DescriptorRing& ring, const char* resetWhat) {
@@ -24,7 +25,7 @@ void TextureDetiler::resetRing(DescriptorRing& ring, const char* resetWhat) {
 
 VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorSetLayout layout, const std::vector<VkDescriptorPoolSize>& sizes, const char* createWhat, const char* allocateWhat, const char* resetWhat) {
     constexpr std::uint32_t setsPerPool = 64;
-    const auto* recorder = Recorder::Active();
+    auto* recorder = Recorder::Active();
     if (ring.pools.empty() || ring.used == setsPerPool) {
         const auto completed = recorder != nullptr ? recorder->CompletedThrough() : 0;
         auto next = ring.pools.size();
@@ -57,9 +58,10 @@ VkDescriptorSet TextureDetiler::allocateFrom(DescriptorRing& ring, VkDescriptorS
     allocation.descriptorSetCount = 1;
     allocation.pSetLayouts = &layout;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    Check(context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets")(context.device, &allocation, &set), allocateWhat);
+    Check(context.Resolved(&DeviceFunctions::allocateDescriptorSets, "vkAllocateDescriptorSets")(context.device, &allocation, &set), allocateWhat);
     ++ring.used;
     ring.serials[ring.current] = recorder != nullptr ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max();
+    if (recorder != nullptr && std::none_of(recorders.begin(), recorders.end(), [&](const auto& used) { return used.first == recorder && used.second == recorder->Id(); })) recorders.emplace_back(recorder, recorder->Id());
     return set;
 }
 

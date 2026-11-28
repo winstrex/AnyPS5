@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "ExecutionHelpers.hpp"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -83,9 +84,9 @@ const std::array<Check, 4> PackedChecks{{
 }};
 
 struct Mode {
-    const char* name;
+    std::string name;
     std::optional<ShaderRecompiler::ShaderFloatMode> floatMode;
-    bool packed = true;
+    bool scalar = true;
 };
 
 const std::array<Mode, 7> Modes{{
@@ -94,8 +95,8 @@ const std::array<Mode, 7> Modes{{
     {"dx10", ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}},
     {"ieee", ShaderRecompiler::ShaderFloatMode{0xc0u, false, true, false}},
     {"none", ShaderRecompiler::ShaderFloatMode{0xc0u, false, false, false}},
-    {"f16 denormals flushed, dx10 ieee", ShaderRecompiler::ShaderFloatMode{0x30u, true, true, false}, false},
-    {"f16 input denormals flushed", ShaderRecompiler::ShaderFloatMode{0xb0u, false, false, false}, false},
+    {"f16 denormals flushed, dx10 ieee", ShaderRecompiler::ShaderFloatMode{0x30u, true, true, false}},
+    {"f16 input denormals flushed", ShaderRecompiler::ShaderFloatMode{0xb0u, false, false, false}},
 }};
 
 std::uint64_t Seed = 0x2545f4914f6cdd1dull;
@@ -214,29 +215,11 @@ struct Model {
                 bits[index] = (registers[source.reg] >> (selectHigh ? 16u : 0u)) & 0xffffu;
                 if (high != 0u ? source.negateHi : source.negate) bits[index] ^= 0x8000u;
             }
-            std::uint32_t lane = Numeric(check.kind == Kind::Max, Read(bits[0]), Read(bits[1])).bits;
-            lane = IsNan(bits[0]) ? bits[1] : lane;
-            lane = IsNan(bits[1]) ? bits[0] : lane;
-            if (ieee) {
-                lane = IsSnan(bits[1]) ? Quiet(bits[1]) : lane;
-                lane = IsSnan(bits[0]) ? Quiet(bits[0]) : lane;
-            }
-            result |= Clamp(check.clamp, lane) << (16u * high);
+            result |= Clamp(check.clamp, Pair(check.kind == Kind::Max, Read(bits[0]), Read(bits[1])).bits) << (16u * high);
         }
         return result;
     }
 };
-
-std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
-    const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
-}
-
-std::string Hex(std::uint32_t value) {
-    char text[16];
-    std::snprintf(text, sizeof(text), "0x%08x", value);
-    return text;
-}
 
 }
 
@@ -262,13 +245,25 @@ int main() {
             request.context.floatMode = mode.floatMode;
             return ShaderRecompiler::Recompile(request);
         };
+        std::vector<Mode> modes(Modes.begin(), Modes.end());
+        for (std::uint32_t rounding = 0; rounding < 4; ++rounding) {
+            for (std::uint32_t denorm = 0; denorm < 4; ++denorm) {
+                for (const bool ieee : {false, true}) {
+                    for (const bool dx10 : {false, true}) {
+                        modes.push_back({"packed rounding=" + std::to_string(rounding) + " denorm=" + std::to_string(denorm) + " ieee=" + std::to_string(ieee) + " dx10=" + std::to_string(dx10),
+                                         ShaderRecompiler::ShaderFloatMode{0x30u | (rounding << 2u) | (denorm << 6u), dx10, ieee, false}, false});
+                    }
+                }
+            }
+        }
+        constexpr std::array<std::uint32_t, 16> special{0x0000u, 0x8000u, 0x7c00u, 0xfc00u, 0x7e01u, 0xfe42u, 0x7c01u, 0xfc42u,
+                                                       0x0001u, 0x8001u, 0x03ffu, 0x83ffu, 0x0400u, 0x8400u, 0x3c00u, 0xbc00u};
         std::uint64_t compared = 0u;
-        for (const auto& mode : Modes) {
+        for (const auto& mode : modes) {
             const bool flushInputs = mode.floatMode.has_value() && (mode.floatMode->floatMode & 0x40u) == 0u;
             const Model model{mode.floatMode.has_value() && mode.floatMode->ieeeMode, !mode.floatMode.has_value() || mode.floatMode->dx10Clamp, flushInputs};
-            const auto scalar = compile(ScalarCode, mode);
-            std::optional<ShaderRecompiler::RecompileResult> packed;
-            if (mode.packed) packed = compile(PackedCode, mode);
+            const auto scalar = mode.scalar ? std::optional{compile(ScalarCode, mode)} : std::nullopt;
+            const auto packed = compile(PackedCode, mode);
             for (std::uint32_t batch = 0; batch < Batches; ++batch) {
                 for (std::uint32_t tid = 0; tid < Threads; ++tid) {
                     std::uint32_t* row = &Input[tid * Inputs];
@@ -277,6 +272,11 @@ int main() {
                     if (tid % 8u == 1u) row[1] = row[0] ^ 0x80008000u;
                     if (tid % 8u == 2u) row[2] = row[1];
                     if (tid % 8u == 3u) row[2] = row[0] ^ 0x80008000u;
+                    if (tid < special.size()) {
+                        for (std::uint32_t index = 0; index < Inputs; ++index) {
+                            row[index] = special[(tid + batch + index) % special.size()] | (special[(tid + batch + index + 7u) % special.size()] << 16u);
+                        }
+                    }
                 }
                 const auto run = [&](const ShaderRecompiler::RecompileResult& result, std::span<const std::uint32_t> code, std::span<const Check> checks, bool isPacked) {
                     Output.fill(0xdeadbeefu);
@@ -292,8 +292,8 @@ int main() {
                         }
                     }
                 };
-                run(scalar, ScalarCode, ScalarChecks, false);
-                if (packed) run(*packed, PackedCode, PackedChecks, true);
+                if (scalar.has_value()) run(*scalar, ScalarCode, ScalarChecks, false);
+                run(packed, PackedCode, PackedChecks, true);
             }
         }
         std::printf("f16 min/max tests passed (%llu results)\n", static_cast<unsigned long long>(compared));

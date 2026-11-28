@@ -1,14 +1,21 @@
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
+#include "prx/libkernel/AppMetadata/include/ParamSfoParser.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/RunReport.hpp"
+#include "prx/libc/include/RunReportComponent.hpp"
 
+#include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace {
@@ -19,12 +26,16 @@ bool g_iconAttempted = false;
 bool g_iconLoaded = false;
 char g_title[128] = {};
 char g_titleId[12] = {};
+char g_contentVersion[16] = {};
 std::uint64_t g_downloadDataSizeMiB = 0;
+std::optional<std::uint32_t> g_applicationCategoryType;
 std::uint32_t g_attribute3 = 0;
+std::optional<std::uint32_t> g_paramSfoAttribute;
 std::int32_t g_userDefinedParams[4] = {};
 std::vector<std::uint8_t> g_iconBytes;
 
 constexpr const char* AppMetadataParamJsonGuestPath = "/app0/sce_sys/param.json";
+constexpr const char* AppMetadataParamSfoGuestPath = "/app0/sce_sys/param.sfo";
 constexpr const char* AppMetadataIconGuestPath = "/app0/sce_sys/icon0.png";
 
 void copyToFixedBuffer(char* destination, std::size_t destinationSize, const std::string& source) {
@@ -33,38 +44,103 @@ void copyToFixedBuffer(char* destination, std::size_t destinationSize, const std
     std::memcpy(destination, source.c_str(), source.size() + 1);
 }
 
+bool fileExists(const std::filesystem::path& path) {
+    std::error_code error;
+    return std::filesystem::exists(path, error);
+}
+
+bool mountDirectory(const std::filesystem::path& path) {
+    std::error_code error;
+    std::filesystem::create_directories(path, error);
+    return !error && std::filesystem::is_directory(path, error);
+}
+
+ParsedParamJson parseParams(const std::filesystem::path& paramJson, const std::filesystem::path& paramSfo) {
+    if (fileExists(paramJson)) return parseParamJson(paramJson);
+    if (fileExists(paramSfo)) return parseParamSfo(paramSfo);
+    throw std::runtime_error("param.json or param.sfo not found");
+}
+
 void ensureTitleLoaded() {
     std::lock_guard lock(g_metadataMutex);
     if (g_titleLoaded) return;
-    const auto resolvedPath = ResolvePath_nid_no_patch(AppMetadataParamJsonGuestPath);
-    if (!std::filesystem::exists(resolvedPath)) throw std::runtime_error("param.json not found");
-    const auto parsed = parseParamJson(resolvedPath);
+    const auto parsed = parseParams(ResolvePath_nid_no_patch(AppMetadataParamJsonGuestPath), ResolvePath_nid_no_patch(AppMetadataParamSfoGuestPath));
     copyToFixedBuffer(g_title, sizeof(g_title), parsed.title);
     copyToFixedBuffer(g_titleId, sizeof(g_titleId), parsed.titleId);
+    if (!parsed.contentVersion.empty() && parsed.contentVersion.size() < sizeof(g_contentVersion)) copyToFixedBuffer(g_contentVersion, sizeof(g_contentVersion), parsed.contentVersion);
     g_downloadDataSizeMiB = parsed.downloadDataSizeMiB;
+    g_applicationCategoryType = parsed.applicationCategoryType;
     g_attribute3 = parsed.attribute3;
+    g_paramSfoAttribute = parsed.paramSfoAttribute;
     std::memcpy(g_userDefinedParams, parsed.userDefinedParams, sizeof(g_userDefinedParams));
     g_titleLoaded = true;
+    if (g_titleId[0] != '\0') {
+        const auto app0 = ResolvePath_nid_no_patch("/app0");
+        AddPathAlias_nid_no_patch((std::string("/mnt/sandbox/") + g_titleId + "_000/app0").c_str(), app0.string().c_str());
+    }
 }
 
-const bool g_downloadDataMounted = [] {
+bool ProvideRunReportGame(RunReportGame* game) {
+    try {
+        ensureTitleLoaded();
+    } catch (const std::exception&) {
+        return false;
+    }
+    std::lock_guard lock(g_metadataMutex);
+    std::memcpy(game->titleId, g_titleId, std::min(sizeof(g_titleId), sizeof(game->titleId) - 1u));
+    std::memcpy(game->contentVersion, g_contentVersion, std::min(sizeof(g_contentVersion), sizeof(game->contentVersion) - 1u));
+    std::memcpy(game->name, g_title, std::min(sizeof(g_title), sizeof(game->name) - 1u));
+    return true;
+}
+
+APS5_RUN_REPORT_COMPONENT("libkernel")
+
+[[maybe_unused]] const bool g_runReportGameProvider = (LibcRunReportSetGameProvider_nid_no_patch(&ProvideRunReportGame), true);
+
+struct StartupErrnoGuard {
+    int saved = errno;
+    ~StartupErrnoGuard() { errno = saved; }
+};
+
+const bool g_sandboxApp0Mounted = [] {
+    const StartupErrnoGuard restoreErrno{};
     try {
         const auto run = std::filesystem::current_path();
-        const auto paramJson = run / "app0" / "sce_sys" / "param.json";
-        if (!std::filesystem::exists(paramJson) || parseParamJson(paramJson).downloadDataSizeMiB == 0) return false;
-        std::filesystem::create_directories(run / "download0");
+        const auto metadata = run / "app0" / "sce_sys";
+        if (!std::filesystem::exists(metadata / "param.json") && !std::filesystem::exists(metadata / "param.sfo")) return false;
+        const auto parsed = parseParams(metadata / "param.json", metadata / "param.sfo");
+        if (parsed.titleId.empty()) return false;
+        AddPathAlias_nid_no_patch((std::string("/mnt/sandbox/") + parsed.titleId + "_000/app0").c_str(), (run / "app0").string().c_str());
         return true;
     } catch (const std::exception&) {
         return false;
     }
 }();
 
-const bool g_dataMounted = [] {
+const bool g_downloadDataMounted = [] {
+    const StartupErrnoGuard restoreErrno{};
     try {
-        const auto run = std::filesystem::current_path();
-        if (!std::filesystem::exists(run / "app0" / "sce_sys" / "param.json")) return false;
-        std::filesystem::create_directories(run / "data");
-        return true;
+        std::error_code error;
+        const auto run = std::filesystem::current_path(error);
+        if (error) return false;
+        const auto metadata = run / "app0" / "sce_sys";
+        if (!fileExists(metadata / "param.json") && !fileExists(metadata / "param.sfo")) return false;
+        if (parseParams(metadata / "param.json", metadata / "param.sfo").downloadDataSizeMiB == 0) return false;
+        return mountDirectory(run / "download0");
+    } catch (const std::exception&) {
+        return false;
+    }
+}();
+
+const bool g_dataMounted = [] {
+    const StartupErrnoGuard restoreErrno{};
+    try {
+        std::error_code error;
+        const auto run = std::filesystem::current_path(error);
+        if (error) return false;
+        const auto metadata = run / "app0" / "sce_sys";
+        if (!fileExists(metadata / "param.json") && !fileExists(metadata / "param.sfo")) return false;
+        return mountDirectory(run / "data");
     } catch (const std::exception&) {
         return false;
     }
@@ -75,7 +151,7 @@ void ensureIconLoaded() {
     if (g_iconAttempted) return;
     g_iconAttempted = true;
     const auto resolvedPath = ResolvePath_nid_no_patch(AppMetadataIconGuestPath);
-    if (!std::filesystem::exists(resolvedPath)) return;
+    if (!fileExists(resolvedPath)) return;
     std::ifstream file(resolvedPath, std::ios::binary);
     if (!file.is_open()) throw std::runtime_error("failed to open icon0.png");
     file.seekg(0, std::ios::end);
@@ -112,6 +188,13 @@ std::uint32_t GetAppAttribute3_nid_no_patch() {
     return g_attribute3;
 }
 
+bool GetAppParamSfoAttribute_nid_no_patch(std::uint32_t* attribute) {
+    ensureTitleLoaded();
+    if (!g_paramSfoAttribute) return false;
+    *attribute = *g_paramSfoAttribute;
+    return true;
+}
+
 std::int32_t GetAppUserDefinedParam_nid_postfix(std::uint32_t index) {
     if (index >= 4) throw std::out_of_range("user defined param index out of range");
     ensureTitleLoaded();
@@ -123,6 +206,25 @@ AppTitleId GetAppTitleId_nid_postfix() {
     AppTitleId result{};
     std::memcpy(result.value, g_titleId, sizeof(result.value));
     return result;
+}
+
+bool HasAppParamJson_nid_no_patch() {
+    return fileExists(ResolvePath_nid_no_patch(AppMetadataParamJsonGuestPath));
+}
+
+AppContentVersion GetAppContentVersion_nid_no_patch() {
+    ensureTitleLoaded();
+    AppContentVersion result{};
+    std::memcpy(result.value, g_contentVersion, sizeof(result.value));
+    return result;
+}
+
+bool GetAppCategoryType_nid_no_patch(std::uint32_t* categoryType) {
+    if (categoryType == nullptr) return false;
+    ensureTitleLoaded();
+    if (!g_applicationCategoryType) return false;
+    *categoryType = *g_applicationCategoryType;
+    return true;
 }
 
 bool HasAppIcon_nid_postfix() {

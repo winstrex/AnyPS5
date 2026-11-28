@@ -38,6 +38,7 @@ struct ResourceCapture {
     // The walk's read addresses when the plan has pure flat slots (the leaf of each pure slot,
     // and every other read sorted and deduplicated); empty otherwise.
     SrtReadTrace readTrace;
+    SrtUserDataUse userDataUse;
     // APS5_PROFILE_DRAW: what CaptureResources spent resolving the source (the stage inputs, the
     // key over the code, the plan) before the walk.
     std::uint64_t sourceNanoseconds = 0;
@@ -64,6 +65,9 @@ public:
     const RecompileRequest& Request() const { return request; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
+    [[nodiscard]] std::shared_ptr<const RecompileResult> MaterializeIfMemoized(const ResourceCapture& capture, bool* contended = nullptr) const;
+    [[nodiscard]] PreparedShaderInvocation Rebound(const RecompileRequest& request) const;
+    [[nodiscard]] std::uint64_t SnapshotKey(const ResourceCapture& capture) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
@@ -80,6 +84,7 @@ void BuildPreparedShaderKey(const RecompileRequest& request, std::vector<std::ui
 [[nodiscard]] std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest& request, const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request);
+void ReleaseUndrawnResourcePlan(const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime, const SourceHandle& handle);
 
 }

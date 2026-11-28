@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include <cstdint>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -12,6 +13,7 @@ public:
     ~Buffer();
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
+    static std::shared_ptr<Buffer> WithinDeviceLocalHeadroom(const Context& context, std::size_t size, VkBufferUsageFlags usage);
     VkBuffer Handle() const;
     VkDeviceAddress DeviceAddress() const;
     // Host-visible buffers only: a device-local one (properties without HOST_VISIBLE, the staging
@@ -21,6 +23,7 @@ public:
     void Invalidate();
 
 private:
+    Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool headroom);
     void initializeAddress(VkBufferUsageFlags usage);
     void release() noexcept;
     Context context;
@@ -64,6 +67,7 @@ private:
     VkBufferUsageFlags usage;
     std::shared_ptr<BufferPool> cache;
     bool hostPlaced = false;
+    bool ready = false;
 };
 
 // Records a whole-range buffer copy.
@@ -90,7 +94,11 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize memoryBytes = 0;
+    std::uint32_t memoryType = 0;
 };
+
+void NoteGuestWorkOnCommandBuffer(VkCommandBuffer commands);
 
 class CommandBatch {
 public:
@@ -111,6 +119,13 @@ private:
     bool pending = false;
     bool submitted = false;
 };
+
+struct CommandBatchStalls {
+    std::uint64_t waits = 0;
+    std::uint64_t slices = 0;
+};
+
+CommandBatchStalls CommandBatchWaitStalls();
 
 }
 

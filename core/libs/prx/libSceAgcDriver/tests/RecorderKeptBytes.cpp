@@ -1,14 +1,20 @@
+#include <limits>
+#include <stdexcept>
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
@@ -30,16 +36,29 @@ struct MockDevice {
     std::map<VkFence, bool> signaled;
     std::uint64_t submits = 0;
     std::uint64_t fenceWaits = 0;
+    std::uint64_t allocatedCommands = 0;
+    std::uint64_t freedCommands = 0;
+    VkResult endResult = VK_SUCCESS;
+    VkResult submitResult = VK_SUCCESS;
+    bool lostSubmissionPending = false;
+    std::uint64_t idleWaits = 0;
+    VkResult idleResult = VK_ERROR_DEVICE_LOST;
 };
 
 MockDevice mock;
+std::vector<char> commandOrder;
+std::vector<std::pair<VkPipelineStageFlags, VkAccessFlags>> barrierMasks;
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer* commands) {
     *commands = reinterpret_cast<VkCommandBuffer>(mock.next++);
+    ++mock.allocatedCommands;
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockFreeCommandBuffers(VkDevice, VkCommandPool, std::uint32_t, const VkCommandBuffer*) {}
+VKAPI_ATTR void VKAPI_CALL mockFreeCommandBuffers(VkDevice, VkCommandPool, std::uint32_t count, const VkCommandBuffer*) {
+    Expect(!mock.lostSubmissionPending, "command buffers were freed before the lost submission finished");
+    mock.freedCommands += count;
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* fence) {
     *fence = reinterpret_cast<VkFence>(mock.next++);
@@ -48,6 +67,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo
 }
 
 VKAPI_ATTR void VKAPI_CALL mockDestroyFence(VkDevice, VkFence fence, const VkAllocationCallbacks*) {
+    Expect(!mock.lostSubmissionPending, "a fence was destroyed before the lost submission finished");
     mock.signaled.erase(fence);
 }
 
@@ -62,6 +82,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockWaitForFences(VkDevice, std::uint32_t count, 
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockResetFences(VkDevice, std::uint32_t count, const VkFence* fences) {
+    Expect(!mock.lostSubmissionPending, "a fence was reset before the lost submission finished");
     for (std::uint32_t i = 0; i < count; ++i) mock.signaled.at(fences[i]) = false;
     return VK_SUCCESS;
 }
@@ -71,16 +92,26 @@ VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer, const VkC
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockEndCommandBuffer(VkCommandBuffer) {
-    return VK_SUCCESS;
+    return mock.endResult;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) {
     ++mock.submits;
-    return VK_SUCCESS;
+    if (mock.submitResult == VK_ERROR_DEVICE_LOST) mock.lostSubmissionPending = true;
+    return mock.submitResult;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) {}
-VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {}
+VKAPI_ATTR VkResult VKAPI_CALL mockDeviceWaitIdle(VkDevice) {
+    ++mock.idleWaits;
+    mock.lostSubmissionPending = false;
+    return mock.idleResult;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer, VkDeviceSize, VkDeviceSize, const void*) { commandOrder.push_back('U'); }
+VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer, VkPipelineStageFlags, VkPipelineStageFlags dstStage, VkDependencyFlags, std::uint32_t memoryBarrierCount, const VkMemoryBarrier* memoryBarriers, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+    commandOrder.push_back('B');
+    barrierMasks.push_back({dstStage, memoryBarrierCount == 0 ? 0u : memoryBarriers[0].dstAccessMask});
+}
 VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
 VKAPI_ATTR void VKAPI_CALL mockCmdResetQueryPool(VkCommandBuffer, VkQueryPool, std::uint32_t, std::uint32_t) {}
@@ -101,6 +132,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkBeginCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockBeginCommandBuffer)},
         {"vkEndCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockEndCommandBuffer)},
         {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(mockQueueSubmit)},
+        {"vkDeviceWaitIdle", reinterpret_cast<PFN_vkVoidFunction>(mockDeviceWaitIdle)},
         {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)},
         {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPipelineBarrier)},
         {"vkCmdBeginQuery", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBeginQuery)},
@@ -194,6 +226,29 @@ void CountFollowsEveryPath() {
     Expect(recorder.Reap() && recorder.InFlightKeptBytes() == 0, "a reaped batch still counts " + std::to_string(recorder.InFlightKeptBytes()) + " kept bytes in flight");
 }
 
+void SubmittedWorkRunningFollowsTheLastBatch() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    Expect(!recorder.SubmittedWorkRunning(), "a recorder with nothing submitted reported running GPU work");
+    recorder.Keep(std::make_shared<int>(0));
+    Expect(!recorder.SubmittedWorkRunning(), "an open, unsubmitted batch counted as running GPU work");
+    recorder.Submit();
+    recorder.Keep(std::make_shared<int>(1));
+    recorder.Submit();
+    Expect(recorder.InFlightBatches() == 2 && recorder.SubmittedWorkRunning(), "two unfinished submitted batches did not count as running GPU work");
+    auto last = mock.signaled.end();
+    --last;
+    last->second = true;
+    Expect(!recorder.SubmittedWorkRunning(), "finished last batch still counted as running GPU work");
+    last->second = false;
+    mock.signaled.begin()->second = true;
+    Expect(recorder.SubmittedWorkRunning(), "a finished first batch hid the unfinished last one");
+    for (auto& [fence, signaled] : mock.signaled) signaled = true;
+    recorder.Sync();
+    Expect(!recorder.SubmittedWorkRunning(), "a synced recorder reported running GPU work");
+}
+
 void SharedOwnerCountsOncePerBatch() {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -216,15 +271,207 @@ void SharedOwnerCountsOncePerBatch() {
     recorder.Sync();
 }
 
+template<typename Condition>
+bool EventuallyTrue(Condition&& condition) {
+    for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
+        for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1); std::chrono::steady_clock::now() < until;) std::this_thread::yield();
+    }
+    return condition();
+}
+
+void RetentionGrowsWithoutDuplicates() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    std::vector<std::shared_ptr<int>> owners;
+    for (int i = 0; i < 100; ++i) owners.push_back(std::make_shared<int>(i));
+    for (int round = 0; round < 2; ++round) {
+        for (std::size_t i = 0; i < owners.size(); ++i) {
+            recorder.Retain(owners[i]);
+            if (i % 3 == 0) recorder.Keep(std::make_shared<int>(0));
+            if (i % 7 == 0) recorder.Retain(owners[i / 2]);
+        }
+    }
+    for (std::size_t i = 0; i < owners.size(); ++i) Expect(owners[i].use_count() == 2, "owner " + std::to_string(i) + " was retained " + std::to_string(owners[i].use_count() - 1) + " times after the lookup grew");
+    recorder.Submit();
+    for (auto& owner : owners) Expect(owner.use_count() == 2, "submission changed an owner's retention");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Expect(EventuallyTrue([&] { return std::all_of(owners.begin(), owners.end(), [](const auto& owner) { return owner.use_count() == 1; }); }), "completion did not release a retained owner");
+}
+
+void RetentionAfterFailedSubmission() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    auto owner = std::make_shared<int>(1);
+    recorder.Retain(owner);
+    mock.endResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    mock.endResult = VK_SUCCESS;
+    Expect(failed && owner.use_count() == 1, "a failed batch kept its retained owner");
+    recorder.Retain(owner);
+    Expect(owner.use_count() == 2, "the replacement batch did not retain a live owner the failed batch had retained");
+    recorder.Retain(owner);
+    Expect(owner.use_count() == 2, "the replacement batch retained an owner twice");
+    recorder.Submit();
+    Expect(!recorder.Reap() && owner.use_count() == 2, "the replacement batch released its owner before its fence");
+    for (auto& [fence, signaled] : mock.signaled) signaled = true;
+    Expect(recorder.Reap(), "the replacement batch was not retired after its fence");
+    recorder.FlushDeferredReleases();
+    Expect(EventuallyTrue([&] { return owner.use_count() == 1; }), "the replacement batch kept its owner after its fence");
+}
+
+void SeparateStoresOfOneRunAreOrdered() {
+    if (std::getenv("APS5_LABEL_RUNS_INLINE") != nullptr || std::getenv("APS5_NO_LABEL_RUNS") != nullptr) {
+        std::printf("skipping SeparateStoresOfOneRunAreOrdered: APS5_LABEL_RUNS_INLINE/APS5_NO_LABEL_RUNS disables per-batch label runs\n");
+        return;
+    }
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    const auto b1 = reinterpret_cast<VkBuffer>(0x1000);
+    const auto b2 = reinterpret_cast<VkBuffer>(0x2000);
+    const std::array<std::byte, 4> bytes1{};
+    const std::array<std::byte, 4> bytes2{};
+    const std::uint64_t a1 = 0x7f0000000000;
+    const std::uint64_t a2 = 0x7f0000000100;
+    commandOrder.clear();
+    barrierMasks.clear();
+    recorder.RecordStore(b1, 0, bytes1, a1);
+    recorder.RecordStore(b2, 0, bytes2, a2);
+    recorder.Submit();
+    const auto firstUpdate = std::find(commandOrder.begin(), commandOrder.end(), 'U');
+    const auto secondUpdate = firstUpdate == commandOrder.end() ? commandOrder.end() : std::find(std::next(firstUpdate), commandOrder.end(), 'U');
+    const auto barrierBetween = firstUpdate != commandOrder.end() && secondUpdate != commandOrder.end() && std::find(std::next(firstUpdate), secondUpdate, 'B') != secondUpdate;
+    Expect(barrierBetween, "the stores of a run into different buffers are not separated by a barrier");
+    if (barrierBetween) {
+        const auto index = static_cast<std::size_t>(std::count(commandOrder.begin(), firstUpdate, 'B'));
+        const auto& [dstStage, dstAccess] = barrierMasks.at(index);
+        Expect((dstStage & VK_PIPELINE_STAGE_HOST_BIT) != 0u, "the barrier between the stores of a run does not make the earlier store available to the host stage");
+        Expect((dstAccess & VK_ACCESS_HOST_READ_BIT) != 0u, "the barrier between the stores of a run does not make the earlier store readable by the host");
+    }
+    Expect(std::count(commandOrder.begin(), commandOrder.end(), 'U') == 2, "a run of two stores into different buffers did not record exactly two updates");
+}
+
+void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST, bool budgetedKeep = false) {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    alignas(8) std::array<std::byte, 128> memory{};
+    const auto address = reinterpret_cast<std::uint64_t>(memory.data());
+    bool completed = false;
+    bool earlierCompleted = false;
+    bool earlierWrittenBack = false;
+    {
+        Recorder recorder(mockContext());
+        recorder.Activate();
+        recorder.Keep(std::make_shared<int>(0), 17);
+        recorder.NoteLabel(address, std::span<const std::byte>(memory).first(4), 1, 0);
+        recorder.OnComplete([&] { earlierWrittenBack = true; });
+        Expect(recorder.AfterRecordedWork([&] { earlierCompleted = true; }), "the earlier batch did not accept its completion");
+        recorder.Submit();
+        auto kept = std::shared_ptr<int>(new int(1), [](int* object) {
+            Expect(!mock.lostSubmissionPending, "kept resources were destroyed before the lost submission finished");
+            delete object;
+        });
+        std::weak_ptr<int> released = kept;
+        if (budgetedKeep) {
+            recorder.Keep(kept, Budget);
+        } else {
+            recorder.Retain(kept);
+            recorder.KeepBytes(kept.get(), Budget);
+        }
+        kept.reset();
+        recorder.NoteLabel(address + 8, std::span<const std::byte>(memory).first(4), 2, 0);
+        recorder.NoteLabel(address + 16, std::span<const std::byte>(memory).first(Recorder::LabelTableBytes + 4), 3, 0);
+        recorder.AfterCompletions(address + 96, std::span<const std::byte>(memory).first(4), 4, 0, false);
+        recorder.OnComplete([&] { completed = true; });
+        Expect(recorder.AfterRecordedWork([&] { completed = true; }), "the failed batch did not accept its completion");
+        mock.endResult = endResult;
+        mock.submitResult = submitResult;
+        mock.idleResult = idleResult;
+        bool failed = false;
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            const auto operation = endResult != VK_SUCCESS ? "vkEndCommandBuffer recorder" : "vkQueueSubmit recorder";
+            failed = std::string_view(error.what()).find(operation) != std::string_view::npos;
+        }
+        Expect(failed, "submission did not report its Vulkan failure");
+        Expect(released.expired() && !completed, "a failed batch retained objects or ran its completions");
+        Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightBatches() == 1 && recorder.InFlightKeptBytes() == 17,
+            "the failed batch changed the earlier in-flight submission");
+        Expect(recorder.PendingLabels() == 1 && recorder.PendingLabelIn(address, 4), "a failed batch retained labels or removed the earlier batch's label");
+        Expect(!recorder.PendingLabelIn(address + 8, 4) && !recorder.PendingLabelIn(address + 16, Recorder::LabelTableBytes + 4),
+            "a failed batch retained a narrow or wide label");
+        Expect(!recorder.CompletionLabelIn(address + 96, 4) && Recorder::PendingCompletionLabels() == 1 && Recorder::PendingWriteBackCompletions() == 1,
+            "a failed batch retained pending completions or removed earlier ones");
+        Expect(!Recorder::PendingLabelSince().has_value(), "a failed batch left its label flush deadline pending");
+        Expect(Recorder::SnapshotWriteOverlaps(address, 4) && !Recorder::SnapshotWriteOverlaps(address + 8, 100),
+            "a failed batch left stale writes in the pending snapshot or removed an earlier write");
+        Expect(mock.fenceWaits == 0, "a failed submission waited for an unsignaled fence");
+        Expect(mock.idleWaits == (submitResult == VK_ERROR_DEVICE_LOST ? 1u : 0u), "a failed submission did not settle device loss before releasing its resources");
+        mock.lostSubmissionPending = false;
+        mock.endResult = mock.submitResult = VK_SUCCESS;
+        recorder.Sync();
+        Expect(recorder.Idle() && !completed && earlierCompleted && earlierWrittenBack,
+            "sync ran the failed batch's completions or lost the earlier batch's completions");
+        Expect(Recorder::PendingCompletionLabels() == 0 && Recorder::PendingWriteBackCompletions() == 0,
+            "sync left stale completion counts after submission failure");
+    }
+    Expect(mock.signaled.empty() && mock.allocatedCommands == mock.freedCommands, "a failed submission leaked its fence or command buffer");
+}
+
 }
 
 int main() {
     try {
+        {
+            mock = MockDevice{};
+            Recorder recorder(mockContext());
+            auto object = std::make_shared<int>(7);
+            std::weak_ptr<int> weak = object;
+            bool refused = false;
+            try { recorder.ReserveRetention(std::numeric_limits<std::size_t>::max()); }
+            catch (const std::length_error&) { refused = true; }
+            Expect(refused && object.use_count() == 1, "a failed retention reservation changed ownership");
+            recorder.ReserveRetention(4);
+            recorder.Retain(object);
+            for (int i = 0; i < 100; ++i) recorder.Retain(object);
+            Expect(object.use_count() == 2, "retention copied an owner more than once per batch");
+            auto other = std::shared_ptr<int>(object.get(), [](int*) {});
+            recorder.Retain(other);
+            Expect(other.use_count() == 2, "retention merged distinct owners at the same address");
+            recorder.Submit();
+            recorder.Retain(object);
+            Expect(object.use_count() == 3, "retention omitted the next batch's owner");
+            object.reset();
+            Expect(!weak.expired(), "retention released an unfinished owner");
+            recorder.Sync();
+            Expect(weak.expired() && other.use_count() == 1, "retention outlived batch completion");
+        }
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
         SyncedWithinTwiceTheBudget();
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
+        RetentionGrowsWithoutDuplicates();
+        RetentionAfterFailedSubmission();
+        SubmittedWorkRunningFollowsTheLastBatch();
+        SeparateStoresOfOneRunAreOrdered();
+        FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
+        FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
+        FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);
+        FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        FailedSubmission(VK_SUCCESS, VK_ERROR_DEVICE_LOST);
+        FailedSubmission(VK_SUCCESS, VK_ERROR_DEVICE_LOST, VK_SUCCESS);
+        FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS, VK_ERROR_DEVICE_LOST, true);
+        FailedSubmission(VK_SUCCESS, VK_ERROR_DEVICE_LOST, VK_ERROR_DEVICE_LOST, true);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

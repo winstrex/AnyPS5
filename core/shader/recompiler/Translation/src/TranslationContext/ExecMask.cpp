@@ -145,6 +145,20 @@ std::array<IrU32, 2> TranslationContext::writeMask(const RdnaOperand& operand, I
     }
 }
 
+void TranslationContext::writeMaskLanes(const RdnaOperand& operand, IrU1 lane, IrU1 valid) {
+    switch (operand.kind) {
+        case RdnaOperandKind::ScalarRegister: {
+            const ScalarReg reg = static_cast<ScalarReg>(operand.reg);
+            ir.SetThreadBitScalarReg(reg, lane.Value());
+            ir.SetScalarMaskTag(reg, valid.Value());
+            break;
+        }
+        case RdnaOperandKind::ExecLo: ir.SetExec(lane.Value()); break;
+        case RdnaOperandKind::VccLo: ir.SetVcc(lane.Value()); break;
+        default: break;
+    }
+}
+
 void TranslationContext::writeCompareResult(const RdnaOperand& operand, IrU1 value) {
     if (operand.kind == RdnaOperandKind::Scc) {
         writeOperand(operand, &value.Value());

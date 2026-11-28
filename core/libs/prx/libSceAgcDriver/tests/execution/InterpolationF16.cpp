@@ -10,6 +10,7 @@
 #include <iostream>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -124,7 +125,7 @@ ShaderRecompiler::ShaderPixelStageInfo PixelStage(std::uint32_t waveSize, std::u
     return pixel;
 }
 
-ShaderRecompiler::RecompileResult RecompilePixel(std::span<const std::uint32_t> code, std::uint32_t waveSize, std::uint32_t input0, const ShaderRecompiler::SpirvTarget& target, std::uint32_t pushOffset) {
+ShaderRecompiler::RecompileResult RecompilePixel(std::span<const std::uint32_t> code, std::uint32_t waveSize, std::uint32_t input0, const ShaderRecompiler::SpirvTarget& target, std::uint32_t pushOffset, ShaderRecompiler::ShaderFloatMode floatMode = {0xf0u, true, true, false}) {
     std::vector<std::uint32_t> pixelUserData(8, 0u);
     const auto results = BufferDescriptor(Results.data(), ResultDwords * 4u, Width * Height);
     std::copy(results.begin(), results.end(), pixelUserData.begin() + 4);
@@ -136,7 +137,7 @@ ShaderRecompiler::RecompileResult RecompilePixel(std::span<const std::uint32_t> 
         PixelPushLayout(pushOffset, target)
     };
     fragment.useCache = false;
-    fragment.context.floatMode = ShaderRecompiler::ShaderFloatMode{0xf0u, true, true, false};
+    fragment.context.floatMode = floatMode;
     return ShaderRecompiler::Recompile(fragment);
 }
 
@@ -160,10 +161,14 @@ void Draw(AgcDriver::VulkanDevice& device, std::uint32_t waveSize) {
     const auto vertexResult = ShaderRecompiler::Recompile(vertex);
     const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
     const auto pixelResult = RecompilePixel(PixelCode, waveSize, Fp16Input, target, vertexPush);
-    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
-        {ShaderStage::Vertex, &vertexResult, 0},
-        {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
-    }};
+    Require(pixelResult.barycentricEmulation.active != target.fragmentShaderBarycentricEnabled, "16-bit interpolation must emulate barycentrics exactly when the device lacks them");
+    std::vector<AgcDriver::Graphics::CompiledShader> shaders{{ShaderStage::Vertex, &vertexResult, 0}};
+    ShaderRecompiler::RecompileResult geometry;
+    if (pixelResult.barycentricEmulation.active) {
+        geometry = ShaderRecompiler::BuildBarycentricGeometryShader(vertexResult, pixelResult, target, device.GeometryLimits());
+        shaders.push_back({ShaderStage::Geometry, &geometry, 0});
+    }
+    shaders.push_back({ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)});
 
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, waveSize, waveSize, std::nullopt, std::nullopt};
@@ -259,6 +264,8 @@ ShaderRecompiler::SpirvTarget OfflineTarget(bool barycentric) {
     target.spirvVersion = 0x00010300u;
     target.subgroupSize = 64;
     target.fragmentShaderBarycentricEnabled = barycentric;
+    static constexpr std::array<std::uint32_t, 1> capabilities{spv::CapabilityFloat64};
+    target.supportedCapabilities = capabilities;
     return target;
 }
 
@@ -272,6 +279,15 @@ void ExpectFailure(std::span<const std::uint32_t> code, std::uint32_t input0, bo
     throw std::runtime_error(message);
 }
 
+void ExpectModes(std::uint32_t floatMode, bool ieee, std::uint32_t f32Mode, std::uint32_t f16Mode) {
+    const auto result = RecompilePixel(PixelCode, 64u, Fp16Input, OfflineTarget(true), 0u, {floatMode, true, ieee, false});
+    const auto words = result.spirv.Words();
+    const std::string_view bytes(reinterpret_cast<const char*>(words.data()), words.size_bytes());
+    for (const auto& name : {"interpolate_f32_mode_" + std::to_string(f32Mode), "interpolate_f16_mode_" + std::to_string(f16Mode)}) {
+        Require(bytes.find(name + char{}) != std::string_view::npos, "FLOAT_MODE " + std::to_string(floatMode) + " does not interpolate through " + name);
+    }
+}
+
 void ExpectRejected(std::uint32_t word0, std::uint32_t word1, const char* expected, const char* message) {
     alignas(256) const std::array<std::uint32_t, 3> code{word0, word1, 0xbf810000u};
     ExpectFailure(code, Fp16Input, true, expected, message);
@@ -281,9 +297,19 @@ void ExpectRejected(std::uint32_t word0, std::uint32_t word1, const char* expect
 
 int main() {
     try {
-        ExpectFailure(PixelCode, Fp16Input, false, "requires fragmentShaderBarycentric", "16-bit interpolation was accepted without barycentrics");
+        Require(RecompilePixel(PixelCode, 64u, Fp16Input, OfflineTarget(false), 0u).barycentricEmulation.active, "16-bit interpolation without barycentrics does not emulate them");
+        Require(!RecompilePixel(PixelCode, 64u, Fp16Input, OfflineTarget(true), 0u).barycentricEmulation.active, "16-bit interpolation emulates barycentrics on a device that has them");
         ExpectFailure(PixelCode, 0x03000000u, true, "without FP16_INTERP_MODE", "16-bit interpolation of a 32-bit input was accepted");
         ExpectFailure(PixelCode, 0x03080420u, true, "passes its vertices through unchanged", "16-bit interpolation of a pass-through input was accepted");
+        ExpectModes(0xf0u, true, 1u, 1u);
+        ExpectModes(0x9cu, true, 0x85u, 0x9du);
+        ExpectModes(0x24u, false, 0x106u, 0x10eu);
+        try {
+            static_cast<void>(RecompilePixel(PixelCode, 64u, Fp16Input, OfflineTarget(true), 0u, {0xf1u, true, true, false}));
+            throw std::logic_error("16-bit interpolation accepted f32 directed rounding");
+        } catch (const std::runtime_error& error) {
+            Require(std::string(error.what()).find("needs f32 directed rounding") != std::string::npos, std::string("f32 directed rounding: ") + error.what());
+        }
         ExpectRejected(0xd75a001bu, 0x0c6a0200u, "interpolation modifiers", "v_interp_p2_f16 accepted an output modifier");
         ExpectRejected(0xd75a081bu, 0x046a0200u, "interpolation modifiers", "v_interp_p2_f16 accepted op_sel");
         ExpectRejected(0xd742001au, 0x20020000u, "interpolation modifiers", "v_interp_p1ll_f16 accepted a negated attribute");
@@ -291,12 +317,18 @@ int main() {
         ExpectRejected(0xd743001du, 0x003e0140u, "not a vector register", "v_interp_p1lv_f16 accepted a scalar P0");
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (!device->Target().fragmentShaderBarycentricEnabled) {
-            std::puts("skipped, the device has no fragmentShaderBarycentric");
+        if (!device->Target().fragmentShaderBarycentricEnabled && !device->GeometryLimits()) {
+            std::puts("skipped, the device has no fragmentShaderBarycentric and no geometryShader");
             return VulkanTestSkipped;
         }
         for (const auto waveSize : {64u, 32u}) {
-            Draw(*device, waveSize);
+            try {
+                Draw(*device, waveSize);
+            } catch (const std::exception& error) {
+                if (std::string(error.what()).find("need the Float64 capability") == std::string::npos) throw;
+                std::puts("skipped, the device has no Float64 capability for the exact interpolation sums");
+                return VulkanTestSkipped;
+            }
             Check(waveSize);
         }
         std::puts("16-bit interpolation tests passed");

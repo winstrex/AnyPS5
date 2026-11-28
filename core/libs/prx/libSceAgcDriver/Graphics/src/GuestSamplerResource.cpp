@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestSamplerResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -22,7 +23,8 @@ bool isAnisoFilter(std::uint32_t raw) {
 
 VkSamplerReductionMode toVkReductionMode(std::uint32_t raw) {
     switch (raw) {
-        case 0: return VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT;
+        case 0:
+        case 3: return VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT;
         case 1: return VK_SAMPLER_REDUCTION_MODE_MIN_EXT;
         case 2: return VK_SAMPLER_REDUCTION_MODE_MAX_EXT;
         default: throw std::runtime_error("AGC graphics: guest sampler descriptor uses an unknown reduction filter mode " + std::to_string(raw));
@@ -91,23 +93,20 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     Require(!forceUnormCoords || unnormalizedProven, "guest sampler descriptor uses unnormalized coordinates which are not implemented");
     if (forceUnormCoords) {
         Require(!isAnisoFilter(xyMagFilter) && !isAnisoFilter(xyMinFilter), "guest sampler descriptor uses unnormalized coordinates with anisotropic filtering, which is not implemented");
-        Require(clampX == 0u || clampX == 2u || clampX == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampX) + " on X; only clamp-to-last-texel and clamp-to-border are implemented");
-        Require(clampY == 0u || clampY == 2u || clampY == 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampY) + " on Y; only clamp-to-last-texel and clamp-to-border are implemented");
-        Require(!truncCoord, "guest sampler descriptor uses unnormalized coordinates with TRUNC_COORD, which is not implemented");
+        Require(clampX <= 3u || clampX >= 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampX) + " on X; only wrap, mirror, clamp-to-last-texel, mirror-once, clamp-to-border and mirror-once-border are implemented");
+        Require(clampY <= 3u || clampY >= 6u, "guest sampler descriptor uses unnormalized coordinates with clamp mode " + std::to_string(clampY) + " on Y; only wrap, mirror, clamp-to-last-texel, mirror-once, clamp-to-border and mirror-once-border are implemented");
         Require(!mcCoordTrunc, "guest sampler descriptor uses unnormalized coordinates with MC_COORD_TRUNC, which is not implemented");
     } else {
         Require(!unnormalizedProven, "guest sampler descriptor is bound as unnormalized without FORCE_UNNORMALIZED");
     }
     Require(!forceSrgb || forceDegammaPaired, "guest sampler descriptor forces sRGB decoding which is not implemented");
-    // TRUNC_COORD picks point-sampled texels by truncation instead of rounding, and the perf fields
-    // trade mip/depth precision for speed; Vulkan's nearest filtering already floors, so these only
-    // move texel selection by half a texel at most and are accepted as is. ANISO_THRESHOLD and
+    // The perf fields trade mip/depth precision for speed and are accepted as is. ANISO_THRESHOLD and
     // ANISO_BIAS only tune how many anisotropic taps the hardware takes; the host filter picks its own.
     static_cast<void>(truncCoord);
     static_cast<void>(anisoThreshold);
     static_cast<void>(anisoBias);
     const auto reductionMode = toVkReductionMode(filterMode);
-    Require(!disableDegamma, "guest sampler descriptor disables degamma which is not implemented");
+    static_cast<void>(disableDegamma);
     static_cast<void>(lodBiasSec);
     Require(!pointPreclamp, "guest sampler descriptor uses point preclamping which is not implemented");
     static_cast<void>(anisoOverride);
@@ -116,7 +115,6 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     Require(mipFilter != 2u || reductionMode == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT, "guest sampler descriptor combines a min or max reduction with a linear mip filter, which is not implemented");
 
     const auto aniso = isAnisoFilter(xyMagFilter) || isAnisoFilter(xyMinFilter);
-    Require(!aniso || reductionMode == VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE_EXT, "guest sampler descriptor combines a min or max reduction with anisotropic filtering, which is not implemented");
     auto anisoRatio = 1.0f;
     if (aniso) {
         if (maxAnisoRatio > 4u) Require(false, "guest sampler descriptor uses an unknown anisotropy ratio " + std::to_string(maxAnisoRatio));
@@ -130,6 +128,9 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
         Require(minLodRaw <= maxLodRaw, "guest sampler descriptor has a minimum LOD past its maximum LOD");
         minLod = static_cast<float>(minLodRaw) / 256.0f;
         maxLod = static_cast<float>(maxLodRaw) / 256.0f;
+    } else if (minLodRaw <= maxLodRaw) {
+        minLod = static_cast<float>(std::min(minLodRaw, 1u)) / 256.0f;
+        maxLod = static_cast<float>(std::min(maxLodRaw, 1u)) / 256.0f;
     }
 
     VkBorderColor border;
@@ -160,13 +161,14 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
     const std::array compareOps{VK_COMPARE_OP_NEVER, VK_COMPARE_OP_LESS, VK_COMPARE_OP_EQUAL, VK_COMPARE_OP_LESS_OR_EQUAL, VK_COMPARE_OP_GREATER, VK_COMPARE_OP_NOT_EQUAL, VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_ALWAYS};
     result.compareOp = compareOps.at(depthCompareFunc);
     result.forceDegamma = forceSrgb;
+    result.disableDegamma = disableDegamma;
     result.nonSeamlessCube = disableCubeWrap;
     if (forceUnormCoords) {
         result.unnormalizedCoordinates = true;
         result.minFilter = result.magFilter;
         result.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        result.addressModeU = clampX == 6u ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        result.addressModeV = clampY == 6u ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        result.addressModeU = clampX >= 6u ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        result.addressModeV = clampY >= 6u ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         result.minLod = 0.0f;
         result.maxLod = 0.0f;
         result.lodBias = 0.0f;
@@ -174,6 +176,16 @@ GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words,
         result.maxAnisotropy = 1.0f;
     }
     return result;
+}
+
+bool HoldsLodAtZero(std::span<const std::uint32_t, 4> words) {
+    return (words[0] & (1u << 15u)) == 0u && (((words[2] >> 26u) & 3u) == 0u || ((words[1] >> 12u) & 0xfffu) == 0u);
+}
+
+std::array<std::uint32_t, 4> PinnedLodSamplerWords(std::span<const std::uint32_t, 4> words, std::uint32_t lod) {
+    std::array<std::uint32_t, 4> pinned{words[0], (words[1] & ~0xffffffu) | lod | (lod << 12u), words[2], words[3]};
+    if (((pinned[2] >> 26u) & 3u) == 0u) pinned[2] |= 1u << 26u;
+    return pinned;
 }
 
 std::optional<std::array<std::uint32_t, 4>> SingleLevelSamplerWords(std::span<const std::uint32_t, 4> words, bool singleLevelImage, bool mipmappedImage) {

@@ -1,6 +1,7 @@
 #include "prx/libkernel/DirectMemory/MemoryPool.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -73,19 +74,141 @@ struct PhysicalMemoryPool {
 
         while (cur <= end && alignedLen <= end - cur) {
             size_t lastUsed;
-            if (!_lastUsedPage(static_cast<size_t>(cur / kPage), pageCount, lastUsed)) {
-                _commit(cur, alignedLen, memoryType);
-                *physOut = static_cast<int64_t>(cur);
-                return 0;
+            if (_lastUsedPage(static_cast<size_t>(cur / kPage), pageCount, lastUsed)) {
+                if (!RoundUp(static_cast<uint64_t>(_nextFreePage(lastUsed + 1, static_cast<size_t>(end / kPage))) * kPage, align, cur)) break;
+                continue;
+            }
+            uint64_t claimEnd;
+            if (DirectMemoryReleaseClaimed(cur, cur + alignedLen, &claimEnd)) {
+                if (!RoundUp(claimEnd, align, cur)) break;
+                continue;
+            }
+            _commit(cur, alignedLen, memoryType);
+            *physOut = static_cast<int64_t>(cur);
+            return 0;
+        }
+        return SCE_KERNEL_ERROR_EAGAIN;
+    }
+
+    bool FirstFitVisible(int64_t searchStart, int64_t searchEnd, size_t len, size_t alignment, uint64_t& out) {
+        uint64_t align, alignedLen;
+        if (len == 0 || !NormalizeAlignment(alignment, align) || !NormalizeLength(len, alignedLen)) return false;
+        const uint64_t start = static_cast<uint64_t>(searchStart);
+        const uint64_t end = std::min<uint64_t>(static_cast<uint64_t>(searchEnd), kPoolBytes);
+        uint64_t cur;
+        if (start >= end || !RoundUp(start, align, cur)) return false;
+        std::lock_guard<std::mutex> lock(_mutex);
+        const size_t pageCount = static_cast<size_t>(alignedLen / kPage);
+        while (cur <= end && alignedLen <= end - cur) {
+            const size_t first = static_cast<size_t>(cur / kPage);
+            size_t lastUsed = 0;
+            bool used = false;
+            for (size_t i = pageCount; i-- > 0;) {
+                if (_visiblyUsed(first + i)) {
+                    lastUsed = first + i;
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) {
+                out = cur;
+                return true;
             }
             if (!RoundUp((static_cast<uint64_t>(lastUsed) + 1) * kPage, align, cur)) break;
         }
-        return SCE_KERNEL_ERROR_EAGAIN;
+        return false;
+    }
+
+    void SetHeld(uint64_t start, size_t len, bool held) {
+        uint64_t lo, hi;
+        if (!PageSpan(start, len, lo, hi)) return;
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (uint64_t page = lo / kPage; page < hi / kPage; ++page) _held[page] = held;
+    }
+
+    bool FindVisible(uint64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
+        if (!start || !end || !memoryType || offset >= kPoolBytes) return false;
+        std::lock_guard<std::mutex> lock(_mutex);
+        uint64_t cursor = offset & ~(kPage - 1);
+        for (;;) {
+            BlockMap::const_iterator it = _blocks.upper_bound(cursor);
+            if (it != _blocks.begin() && std::prev(it)->second.end > cursor) --it;
+            else if (!findNext || it == _blocks.end()) return false;
+            const uint64_t blockStart = it->first;
+            const uint64_t blockEnd = it->second.end;
+            uint64_t page = std::max(cursor, blockStart);
+            if (_held[page / kPage]) {
+                if (!findNext) return false;
+                while (page < blockEnd && _held[page / kPage]) page += kPage;
+                if (page >= blockEnd) {
+                    cursor = blockEnd;
+                    if (cursor >= kPoolBytes) return false;
+                    continue;
+                }
+            }
+            uint64_t low = page;
+            while (low > blockStart && !_held[(low - kPage) / kPage]) low -= kPage;
+            uint64_t high = page;
+            while (high < blockEnd && !_held[high / kPage]) high += kPage;
+            *start = static_cast<int64_t>(low);
+            *end = static_cast<int64_t>(high);
+            *memoryType = it->second.type;
+            return true;
+        }
     }
 
     bool Free(uint64_t start, size_t len) { return _release(start, len, false); }
 
     bool CheckedFree(uint64_t start, size_t len) { return _release(start, len, true); }
+
+    bool ClaimRelease(uint64_t start, size_t len, bool requireAllocated) {
+        uint64_t lo, hi;
+        if (!PageSpan(start, len, lo, hi)) return false;
+        std::unique_lock<std::mutex> lock(_mutex);
+        for (;;) {
+            if (requireAllocated && (!_allUsed(static_cast<size_t>(lo / kPage), static_cast<size_t>((hi - lo) / kPage)) || _claimed(lo, hi))) return false;
+            if (!_claimed(lo, hi) && DirectMemoryTryAddReleaseClaim(lo, hi)) return true;
+            _claimFinished.wait(lock);
+        }
+    }
+
+    void WakeReleaseClaims() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _claimFinished.notify_all();
+    }
+
+    void FinishRelease(uint64_t start, size_t len) {
+        uint64_t lo, hi;
+        if (!PageSpan(start, len, lo, hi)) return;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            try {
+                (void)_releaseLocked(lo, hi, false);
+            } catch (...) {
+                DirectMemoryRemoveReleaseClaim(lo);
+                _claimFinished.notify_all();
+                throw;
+            }
+            DirectMemoryRemoveReleaseClaim(lo);
+        }
+        _claimFinished.notify_all();
+    }
+
+    void AbandonRelease(uint64_t start, size_t len) noexcept {
+        uint64_t lo, hi;
+        if (!PageSpan(start, len, lo, hi)) return;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            DirectMemoryRemoveReleaseClaim(lo);
+        }
+        _claimFinished.notify_all();
+    }
+
+    std::unique_lock<std::mutex> Lock() { return std::unique_lock<std::mutex>(_mutex); }
+
+    void RequireLocked(const std::unique_lock<std::mutex>& lock) const {
+        if (lock.mutex() != &_mutex || !lock.owns_lock()) throw std::logic_error("DirectMemory pool: the caller does not hold the pool lock");
+    }
 
     bool Find(uint64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
         if (!start || !end || !memoryType || offset >= kPoolBytes) return false;
@@ -101,10 +224,15 @@ struct PhysicalMemoryPool {
     }
 
     bool Retype(uint64_t start, size_t len, int memoryType) {
+        const auto lock = Lock();
+        return RetypeLocked(lock, start, len, memoryType);
+    }
+
+    bool RetypeLocked(const std::unique_lock<std::mutex>& lock, uint64_t start, size_t len, int memoryType) {
+        RequireLocked(lock);
         uint64_t lo, hi;
         if (!PageSpan(start, len, lo, hi)) return false;
 
-        std::lock_guard<std::mutex> lock(_mutex);
         const bool splitLo = _splitAt(lo);
         try {
             _splitAt(hi);
@@ -118,41 +246,39 @@ struct PhysicalMemoryPool {
         return true;
     }
 
-    bool LargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
-        if (!startOut || !sizeOut) return false;
-        if (searchStart < 0 || searchEnd <= searchStart) return false;
-        uint64_t align;
-        if (!NormalizeAlignment(alignment, align)) return false;
-
-        uint64_t cur;
-        if (!RoundUp(static_cast<uint64_t>(searchStart), kPage, cur)) return false;
-        const uint64_t limit = std::min<uint64_t>(static_cast<uint64_t>(searchEnd), kPoolBytes) & ~(kPage - 1);
+    int LargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
+        if ((alignment & (alignment - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
+        const uint64_t alignMask = std::max<uint64_t>(alignment, kPage) - 1;
+        uint64_t cur = searchStart > 0 ? std::min<uint64_t>(static_cast<uint64_t>(searchStart) & ~(kPage - 1), kPoolBytes) : 0;
+        const uint64_t limit = searchEnd > 0 ? std::min<uint64_t>((static_cast<uint64_t>(searchEnd) + kPage - 1) & ~(kPage - 1), kPoolBytes) : 0;
 
         std::lock_guard<std::mutex> lock(_mutex);
         uint64_t bestStart = 0;
         uint64_t bestSize = 0;
 
         while (cur < limit) {
-            if (_used[cur / kPage]) {
+            if (_visiblyUsed(static_cast<size_t>(cur / kPage))) {
                 cur += kPage;
                 continue;
             }
             uint64_t runEnd = cur;
-            while (runEnd < limit && !_used[runEnd / kPage]) runEnd += kPage;
+            while (runEnd < limit && !_visiblyUsed(static_cast<size_t>(runEnd / kPage))) runEnd += kPage;
 
-            uint64_t alignedStart;
-            if (!RoundUp(cur, align, alignedStart)) break;
-            if (alignedStart < runEnd && runEnd - alignedStart > bestSize) {
-                bestStart = alignedStart;
-                bestSize = runEnd - alignedStart;
+            const int64_t low = std::max(static_cast<int64_t>(cur), searchStart);
+            const int64_t high = std::min(static_cast<int64_t>(runEnd), searchEnd);
+            const int64_t alignedStart = static_cast<int64_t>((static_cast<uint64_t>(low) + alignMask) & ~alignMask);
+            const uint64_t size = static_cast<uint64_t>(high) - static_cast<uint64_t>(alignedStart);
+            if (low < high && alignedStart < high && size > bestSize) {
+                bestStart = static_cast<uint64_t>(alignedStart);
+                bestSize = size;
             }
             cur = runEnd;
         }
 
-        if (bestSize == 0) return false;
+        if (bestSize == 0) return SCE_KERNEL_ERROR_ENOMEM;
         *startOut = static_cast<int64_t>(bestStart);
         *sizeOut = static_cast<size_t>(bestSize);
-        return true;
+        return 0;
     }
 
     size_t FreeRun(uint64_t offset, uint64_t limit) {
@@ -186,6 +312,11 @@ private:
         return false;
     }
 
+    size_t _nextFreePage(size_t first, size_t limit) const {
+        return static_cast<size_t>(std::find(_used + first, _used + limit, false) - _used);
+    }
+    bool _visiblyUsed(size_t page) const { return _used[page] && !_held[page]; }
+
     bool _allUsed(size_t first, size_t count) const {
         for (size_t i = 0; i < count; ++i) {
             if (!_used[first + i]) return false;
@@ -202,7 +333,7 @@ private:
         if (!ins.second) throw std::logic_error("DirectMemory pool: block map and page flags disagree");
 
         try {
-            CreateDirectMemoryBacking(static_cast<int64_t>(start), static_cast<size_t>(len), type);
+            CreateDirectMemoryBacking(static_cast<int64_t>(start), static_cast<size_t>(len));
         } catch (...) {
             _blocks.erase(ins.first);
             throw;
@@ -211,20 +342,33 @@ private:
         _mark(static_cast<size_t>(start / kPage), static_cast<size_t>(len / kPage), true);
     }
 
+    static bool _claimed(uint64_t lo, uint64_t hi) { return DirectMemoryReleaseClaimed(lo, hi, nullptr); }
+
     bool _release(uint64_t start, size_t len, bool requireAllocated) {
         uint64_t lo, hi;
         if (!PageSpan(start, len, lo, hi)) return false;
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _releaseLocked(lo, hi, requireAllocated);
+    }
+
+    bool _releaseLocked(uint64_t lo, uint64_t hi, bool requireAllocated) {
         const size_t first = static_cast<size_t>(lo / kPage);
         const size_t count = static_cast<size_t>((hi - lo) / kPage);
-
-        std::lock_guard<std::mutex> lock(_mutex);
         if (requireAllocated && !_allUsed(first, count)) return false;
 
         const bool splitLo = _splitAt(lo);
         bool splitHi = false;
         try {
             splitHi = _splitAt(hi);
-            ForgetDirectMemory(static_cast<int64_t>(lo), static_cast<size_t>(hi - lo));
+            for (size_t page = first; page < first + count;) {
+                if (!_used[page]) {
+                    ++page;
+                    continue;
+                }
+                const size_t runStart = page;
+                while (page < first + count && _used[page]) ++page;
+                ForgetDirectMemory(static_cast<int64_t>(runStart * kPage), static_cast<size_t>((page - runStart) * kPage));
+            }
         } catch (...) {
             if (splitHi) _unsplitAt(hi);
             if (splitLo) _unsplitAt(lo);
@@ -256,7 +400,9 @@ private:
     }
 
     std::mutex _mutex;
+    std::condition_variable _claimFinished;
     bool _used[kNumPages] = {};
+    bool _held[kNumPages] = {};
     BlockMap _blocks;
 };
 
@@ -270,12 +416,43 @@ int DirectMemoryAlloc(int64_t searchStart, int64_t searchEnd, size_t len, size_t
     }
 }
 
+bool DirectMemoryFirstFitVisible(int64_t searchStart, int64_t searchEnd, size_t len, size_t alignment, int64_t* out) {
+    uint64_t found = 0;
+    if (!PhysicalMemoryPool::Instance().FirstFitVisible(searchStart, searchEnd, len, alignment, found)) return false;
+    *out = static_cast<int64_t>(found);
+    return true;
+}
+
+void DirectMemorySetHeld(int64_t start, size_t len, bool held) {
+    PhysicalMemoryPool::Instance().SetHeld(static_cast<uint64_t>(start), len, held);
+}
+
+bool DirectMemoryFindVisible(int64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
+    return PhysicalMemoryPool::Instance().FindVisible(static_cast<uint64_t>(offset), findNext, start, end, memoryType);
+}
+
 void DirectMemoryFree(int64_t start, size_t len) {
     (void)PhysicalMemoryPool::Instance().Free(static_cast<uint64_t>(start), len);
 }
 
 bool DirectMemoryCheckedFree(int64_t start, size_t len) {
     return PhysicalMemoryPool::Instance().CheckedFree(static_cast<uint64_t>(start), len);
+}
+
+bool DirectMemoryClaimRelease(int64_t start, size_t len, bool requireAllocated) {
+    return PhysicalMemoryPool::Instance().ClaimRelease(static_cast<uint64_t>(start), len, requireAllocated);
+}
+
+void DirectMemoryFinishRelease(int64_t start, size_t len) {
+    PhysicalMemoryPool::Instance().FinishRelease(static_cast<uint64_t>(start), len);
+}
+
+void DirectMemoryAbandonRelease(int64_t start, size_t len) noexcept {
+    PhysicalMemoryPool::Instance().AbandonRelease(static_cast<uint64_t>(start), len);
+}
+
+void DirectMemoryWakeReleaseClaims() {
+    PhysicalMemoryPool::Instance().WakeReleaseClaims();
 }
 
 bool DirectMemoryFind(int64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
@@ -286,7 +463,15 @@ void DirectMemoryRetype(int64_t start, size_t len, int memoryType) {
     (void)PhysicalMemoryPool::Instance().Retype(static_cast<uint64_t>(start), len, memoryType);
 }
 
-bool DirectMemoryLargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
+std::unique_lock<std::mutex> DirectMemoryPoolLock() {
+    return PhysicalMemoryPool::Instance().Lock();
+}
+
+void DirectMemoryRetypeLocked(const std::unique_lock<std::mutex>& pool, int64_t start, size_t len, int memoryType) {
+    (void)PhysicalMemoryPool::Instance().RetypeLocked(pool, static_cast<uint64_t>(start), len, memoryType);
+}
+
+int DirectMemoryLargestFree(int64_t searchStart, int64_t searchEnd, size_t alignment, int64_t* startOut, size_t* sizeOut) {
     return PhysicalMemoryPool::Instance().LargestFree(searchStart, searchEnd, alignment, startOut, sizeOut);
 }
 

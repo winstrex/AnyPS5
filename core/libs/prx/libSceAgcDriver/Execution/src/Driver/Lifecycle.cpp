@@ -1,16 +1,33 @@
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libc/include/HostThread.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "ShaderDiskCache.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
+#include <condition_variable>
 #include <exception>
+#include <mutex>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 #ifdef _WIN32
@@ -20,6 +37,10 @@
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <sys/mman.h>
+#endif
+#ifdef __APPLE__
+#include "prx/libSceAgcDriver/Execution/include/Driver/DriverMemory.hpp"
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -38,7 +59,60 @@ void PrintFailure(std::exception_ptr error) {
     } catch (...) {
         std::fprintf(stderr, "[gpu] driver failure with a non-standard exception\n");
     }
+    FlushAsyncLog_nid_no_patch();
     std::fflush(stderr);
+}
+
+#ifdef __APPLE__
+constexpr std::uint64_t DriverMemoryAddress = MacOsDriverMemoryBase;
+constexpr std::size_t DriverMemoryBytes = DriverMemorySpan;
+constexpr std::uint64_t FsTableAddress = RetargetPs5DriverMemory(0xfe0040000ull);
+#else
+constexpr std::uint64_t DriverMemoryAddress = 0xfe0000000ull + GuestArena::GuestAddressOffset;
+constexpr std::size_t DriverMemoryBytes = 2u << 20u;
+constexpr std::uint64_t FsTableAddress = DriverMemoryAddress + 0x40000ull;
+#endif
+constexpr std::uint64_t FsTableSlotBytes = 16u;
+constexpr std::uint64_t FsTableSlots = 6u;
+constexpr std::uint64_t FsRoutineRecords = 8u;
+constexpr std::uint64_t FsRoutineRecordBytes = 16u;
+constexpr std::uint64_t FsRoutineTableBytes = FsRoutineRecords * FsRoutineRecordBytes;
+constexpr std::uint64_t FsRoutineTableAddress = FsTableAddress + FsTableSlots * FsTableSlotBytes;
+constexpr std::uint64_t FsRoutineAddress = FsRoutineTableAddress + FsRoutineTableBytes;
+constexpr std::uint32_t ScalarSetpcB64LinkS14 = 0xbe80200eu;
+constexpr std::uint32_t ScalarEndProgram = 0xbf810000u;
+constexpr std::uint64_t FsTableDword3 = 0x5204u;
+
+void MapDriverMemory() {
+    void* mapped;
+#ifdef _WIN32
+    mapped = reinterpret_cast<void*>(DriverMemoryAddress);
+    GuestArena::GuestArenaCommit_nid_postfix(mapped, DriverMemoryBytes, PAGE_READWRITE, DriverMemoryBytes);
+#elif defined(__APPLE__)
+    mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
+    if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) munmap(mapped, DriverMemoryBytes);
+#else
+    mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
+#endif
+    if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) throw std::runtime_error("the AGC driver memory was not mapped at its fixed address");
+    auto* routineTable = reinterpret_cast<std::uint64_t*>(FsRoutineTableAddress);
+    for (std::uint64_t record = 0; record < FsRoutineRecords; ++record) {
+        routineTable[record * 2u] = FsRoutineAddress;
+        routineTable[record * 2u + 1u] = 0u;
+    }
+    auto* routine = reinterpret_cast<std::uint32_t*>(FsRoutineAddress);
+    routine[0] = ScalarSetpcB64LinkS14;
+    routine[1] = ScalarEndProgram;
+    auto* slot = reinterpret_cast<std::uint64_t*>(FsTableAddress);
+    slot[0] = (FsRoutineTableAddress & 0xffffffffffffull) | 16ull << 48u;
+    slot[1] = FsTableDword3 << 32u | FsRoutineRecords;
+#ifndef _WIN32
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(mapped, DriverMemoryBytes);
+#endif
+    GuestAllocations::Mutation mutation;
+    mutation.Add(mapped, DriverMemoryBytes, true, true, true);
 }
 
 bool StackHoldsImport() {
@@ -51,6 +125,11 @@ bool StackHoldsImport() {
         std::uintptr_t low = 0;
         std::uintptr_t high = 0;
         Bounds() {
+#ifdef __APPLE__
+            const auto self = pthread_self();
+            high = reinterpret_cast<std::uintptr_t>(pthread_get_stackaddr_np(self));
+            low = high - pthread_get_stacksize_np(self);
+#else
             pthread_attr_t attributes;
             if (pthread_getattr_np(pthread_self(), &attributes) != 0) return;
             void* base = nullptr;
@@ -60,14 +139,14 @@ bool StackHoldsImport() {
                 high = low + size;
             }
             pthread_attr_destroy(&attributes);
+#endif
         }
     };
     thread_local const Bounds bounds;
     const auto low = bounds.low;
     const auto high = bounds.high;
 #endif
-    const volatile unsigned char marker = 0;
-    const auto frame = reinterpret_cast<std::uintptr_t>(&marker);
+    const auto frame = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
     return frame >= low && frame < high && frame - low >= InlineImportStackBytes;
 }
 
@@ -82,7 +161,23 @@ Driver& Driver::Get() {
     return driver;
 }
 
+void Driver::ReapAfterGpuProgress() {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+    auto& driver = Get();
+    while (completionsPending()) {
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+        if (gpuLock.owns_lock()) {
+            driver.bumpEpoch(&EpochBumps::reaps);
+            if (const auto localDevice = driver.device.Load()) localDevice->ReapRecorded();
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) return;
+        std::this_thread::yield();
+    }
+}
+
 Driver::~Driver() {
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix(nullptr);
     stop();
 }
@@ -93,10 +188,68 @@ void Driver::Shutdown() {
     rethrowFailure();
 }
 
+#ifdef APS5_PROFILE_GENERATE
+extern "C" void __gcov_dump(void);
+extern "C" void __gcov_reset(void);
+
+namespace {
+
+struct ProfileDumps {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::thread thread;
+    bool stopping = false;
+};
+
+ProfileDumps& profileDumps() {
+    static auto* const dumps = new ProfileDumps();
+    return *dumps;
+}
+
+void dumpProfile() {
+    __gcov_dump();
+    __gcov_reset();
+}
+
+void startProfileDumps() {
+    auto& dumps = profileDumps();
+    std::lock_guard lock(dumps.mutex);
+    if (dumps.stopping || dumps.thread.joinable()) return;
+    dumps.thread = std::thread([&dumps] {
+        std::unique_lock wait(dumps.mutex);
+        while (!dumps.wake.wait_for(wait, std::chrono::seconds(20), [&] { return dumps.stopping; })) dumpProfile();
+    });
+}
+
+void stopProfileDumps() {
+    auto& dumps = profileDumps();
+    {
+        std::lock_guard lock(dumps.mutex);
+        if (dumps.stopping) return;
+        dumps.stopping = true;
+    }
+    dumps.wake.notify_one();
+    if (dumps.thread.joinable()) dumps.thread.join();
+    dumpProfile();
+}
+
+}
+#else
+namespace {
+
+void startProfileDumps() {}
+
+void stopProfileDumps() {}
+
+}
+#endif
+
 void Driver::stop() {
     require(!onWorkerThread(), "worker cannot stop itself");
     std::lock_guard shutdownLock(shutdownMutex);
     if (stopped) return;
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(nullptr);
+    if (!GuestMemory::StopHostWrites(1000)) std::fprintf(stderr, "[driver] a host write was still inside the driver's hook 1 s into the shutdown; stopping without waiting for it\n");
     LibcRequestShutdown_nid_postfix();
     {
         std::lock_guard lock(mutex);
@@ -112,26 +265,52 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    try {
+        DrawFinisher::Get().Drain();
+    } catch (...) {
+    }
+    DrawPipeline::Queue0().Stop();
+    DrawPipeline::Queue0().ReleaseRetired();
+    DrawFinisher::Get().ReleaseRan();
     StopWorkerSampler();
     CloseRegistrationPreparation();
+    Graphics::StopPipelineLibraryWorker();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    Graphics::ReportHostImports();
     device.Reset();
     replacedDevices.clear();
+    Graphics::FlushPipelineJournal();
     Graphics::ShutdownGuestBufferWorkers();
+    Graphics::StopCompareHelpers();
+    ShaderRecompiler::ShaderDiskCache::Shutdown();
     PerformanceTrace::StopOutput();
+    FlushAsyncLogAtEnd_nid_no_patch();
     StopProfileOutput_nid_no_patch();
+    CaptureTrace::Stop();
+    stopProfileDumps();
     stopped = true;
 }
 
 Driver::Driver() {
+    startProfileDumps();
+    InstallAsyncLog_nid_no_patch();
+    Graphics::Recorder::SetGpuProgressHook(&Driver::ReapAfterGpuProgress);
+    static const bool driverMemory = (MapDriverMemory(), true);
+    static_cast<void>(driverMemory);
+    LibcSetExitDrain_nid_no_patch([] {
+        const auto current = Driver::Get().device.Load();
+        if (current) current->SavePipelineCache();
+    });
     static_cast<void>(GuestMemory::TrackerGeneration());
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
+    GuestMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });
     } catch (...) {
         stop();
         throw;
     }
+    GuestArena::GuestArenaSetHostWriteHook_nid_no_patch(&GuestMemory::PrepareHostWrite);
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& ranges, std::uint64_t generation) {
         const auto import = [&] {
             try {
@@ -149,7 +328,7 @@ Driver::Driver() {
         }
         std::thread host;
         try {
-            host = std::thread(import);
+            host = Libc::StartHostThread(import);
         } catch (const std::system_error& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory at its mapping failed: no host thread to run it on: %s\n", error.what());
             return;
@@ -157,17 +336,129 @@ Driver::Driver() {
         gpuMapImportThreads.fetch_add(1, std::memory_order_relaxed);
         host.join();
     });
+    PerformanceOverlay::SetDriverCounters([] { return Driver::Get().OverlayCounters(); });
 }
 
 void Driver::WaitIdle() {
     require(!onWorkerThread(), "worker cannot wait for itself");
+    {
+        std::unique_lock lock(mutex);
+        const auto target = accepted;
+        ++idleWaiters;
+        changed.wait(lock, [&] { return failure != nullptr || stopping || completed >= target; });
+        --idleWaiters;
+        rethrowFailure();
+        checkStopping();
+    }
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+}
+
+void Driver::WaitDeviceIdle() {
+    if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+}
+
+bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
     std::unique_lock lock(mutex);
     const auto target = accepted;
     ++idleWaiters;
-    changed.wait(lock, [&] { return failure != nullptr || stopping || completed >= target; });
+    const bool idle = changed.wait_for(lock, timeout, [&] { return failure != nullptr || stopping || completed >= target; });
     --idleWaiters;
     rethrowFailure();
     checkStopping();
+    return idle;
+}
+
+bool Driver::WaitIdleUnlessTitleWaitsFor(std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    std::unique_lock lock(mutex);
+    const auto target = accepted;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto idle = [&] { return failure != nullptr || stopping || completed >= target; };
+    const auto titleWaits = [&] {
+        return std::any_of(awaitedSlots.begin(), awaitedSlots.end(), [&](const AwaitedSlot& slot) {
+            const auto awaited = slot.address.load(std::memory_order_acquire);
+            return awaited != 0 && awaitsTitle(awaited);
+        });
+    };
+    ++idleWaiters;
+    while (!idle() && !titleWaits() && std::chrono::steady_clock::now() < deadline) changed.wait_for(lock, std::chrono::milliseconds(1));
+    --idleWaiters;
+    rethrowFailure();
+    checkStopping();
+    return idle();
+}
+
+bool Driver::WaitSettledFor(std::chrono::milliseconds timeout) {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    std::unique_lock lock(mutex);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto settled = [&] {
+        if (failure != nullptr || stopping) return true;
+        captureHold.store(true, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (completed >= accepted || parkedOnTitle()) return true;
+        captureHold.store(false, std::memory_order_relaxed);
+        return false;
+    };
+    ++idleWaiters;
+    bool done = settled();
+    while (!done && std::chrono::steady_clock::now() < deadline) done = changed.wait_for(lock, std::chrono::milliseconds(1), settled);
+    --idleWaiters;
+    rethrowFailure();
+    checkStopping();
+    return done;
+}
+
+bool Driver::SettledHeld() {
+    std::lock_guard lock(mutex);
+    return captureHold.load(std::memory_order_relaxed);
+}
+
+bool Driver::Settled() {
+    std::lock_guard lock(mutex);
+    return failure != nullptr || stopping || completed >= accepted || parkedOnTitle();
+}
+
+void Driver::ReleaseSettled() {
+    if (!captureHold.load(std::memory_order_relaxed)) return;
+    {
+        std::lock_guard lock(mutex);
+        captureHold.store(false, std::memory_order_relaxed);
+    }
+    changed.notify_all();
+}
+
+std::vector<AwaitedWait> Driver::AwaitedWaits() {
+    std::vector<AwaitedWait> result;
+    for (const auto& slot : awaitedSlots) {
+        const auto fields = readAwaited(slot, 0);
+        if (!fields) continue;
+        AwaitedWait wait;
+        wait.address = fields->address;
+        wait.reference = fields->reference;
+        wait.mask = fields->mask;
+        wait.function = static_cast<std::uint32_t>(fields->shape);
+        wait.bytes = static_cast<std::uint32_t>(fields->shape >> 32u);
+        if (awaitedUnchanged(slot, *fields)) result.push_back(wait);
+    }
+    return result;
+}
+
+void Driver::WaitForPipelineJournal() {
+    std::shared_ptr<VulkanDevice> localDevice = device.Load();
+    if (localDevice == nullptr) {
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (device == nullptr) device = std::make_shared<VulkanDevice>();
+        localDevice = device;
+    }
+    localDevice->WaitForPipelineJournalReplay();
+}
+
+std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
+    std::lock_guard lock(mutex);
+    return {accepted, completed};
 }
 
 void Driver::CheckFailure() {
@@ -186,6 +477,10 @@ void Driver::ReportFailure(std::exception_ptr error) {
         first = !failure;
         if (first) failure = error;
         failed.store(true, std::memory_order_release);
+        {
+            std::lock_guard tails(tailsMutex);
+            unreadTails.clear();
+        }
         for (const auto& [handle, output] : outputs) output->Fail(failure);
         for (auto& [queue, worker] : workers) {
             for (const auto& item : worker.pending) {
@@ -215,4 +510,21 @@ bool& Driver::onWorkerThread() {
     return worker;
 }
 
+}
+
+namespace AgcDriver {
+
+void FlushAsyncLog_nid_no_patch() {
+    AsyncLog::Get().Flush();
+}
+
+std::unique_lock<std::mutex> HoldAsyncLog() {
+    return AsyncLog::Get().Hold();
+}
+
+}
+
+extern "C" void* AgcDriverStaticTable_nid_postfix() {
+    static_cast<void>(AgcDriver::DriverDetail::Driver::Get());
+    return reinterpret_cast<void*>(AgcDriver::DriverDetail::FsTableAddress);
 }

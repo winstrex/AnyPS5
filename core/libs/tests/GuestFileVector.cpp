@@ -1,5 +1,10 @@
+#include "prx/libkernel/include/Api.hpp"
+#include "prx/libkernel/File/include/File.hpp"
+#include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libkernel/File/include/FileFlags.hpp"
+#include <array>
+#include <barrier>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -9,46 +14,29 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <string>
+#include <thread>
+#include <vector>
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <winioctl.h>
 #include <fcntl.h>
 #include <io.h>
+using AllocateFunction = PVOID (WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+using MapFunction = PVOID (WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
 static int MakePipe(int* ends) { return ::_pipe(ends, 64, _O_BINARY); }
 static int ClosePipe(int end) { return ::_close(end); }
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 static int MakePipe(int* ends) { return ::pipe(ends); }
 static int ClosePipe(int end) { return ::close(end); }
 #endif
-
-struct GuestIovec {
-    void* base;
-    std::size_t length;
-};
-
-extern "C" {
-int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
-int APS5_VABI sceKernelClose(int);
-std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
-std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
-int APS5_VABI sceKernelLseek(int, std::int64_t, int);
-std::int64_t APS5_VABI sceKernelReadv(int, const GuestIovec*, int);
-std::int64_t APS5_VABI readv_nid_postfix(int, const GuestIovec*, int);
-std::int64_t APS5_VABI writev_nid_postfix(int, const GuestIovec*, int);
-int* APS5_VABI __error_nid_postfix();
-std::int64_t APS5_VABI sceKernelWritev(int, const GuestIovec*, int);
-std::int64_t APS5_VABI sceKernelPreadv(int, const GuestIovec*, int, std::int64_t);
-std::int64_t APS5_VABI sceKernelPwritev(int, const GuestIovec*, int, std::int64_t);
-std::int64_t APS5_VABI preadv_nid_postfix(int, const GuestIovec*, int, std::int64_t);
-std::int64_t APS5_VABI pwritev_nid_postfix(int, const GuestIovec*, int, std::int64_t);
-int* APS5_VABI __error_nid_postfix();
-std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
-std::int64_t APS5_VABI sceKernelPwrite(int, const void*, std::size_t, std::int64_t);
-std::int64_t APS5_VABI pread_nid_postfix(int, void*, std::size_t, std::int64_t);
-std::int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int, const void*, std::size_t, std::int64_t);
-int APS5_VABI sceKernelFtruncate(int, std::int64_t);
-}
 
 static void Check(bool value, int line) {
     if (!value) {
@@ -69,10 +57,250 @@ static std::string Contents(const std::filesystem::path& path) {
     return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
 }
 
+static void ConcurrentRecords(const std::filesystem::path& path) {
+    constexpr std::size_t Workers = 4;
+    constexpr std::size_t Records = 256;
+    constexpr std::size_t Parts = 32;
+    constexpr std::size_t RecordBytes = Parts * sizeof(std::uint16_t);
+    { std::ofstream stream(path, std::ios::binary); Require(static_cast<bool>(stream)); }
+    std::array<int, Workers> descriptors{};
+    descriptors[0] = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDWR, 0);
+    Require(descriptors[0] >= 0);
+    for (std::size_t worker = 1; worker < Workers; ++worker) {
+        descriptors[worker] = dup_nid_postfix(descriptors[0]);
+        Require(descriptors[worker] >= 0);
+    }
+    std::barrier start(static_cast<std::ptrdiff_t>(Workers));
+    std::array<std::thread, Workers> writers;
+    for (std::size_t worker = 0; worker < Workers; ++worker) {
+        writers[worker] = std::thread([&, worker] {
+            std::uint16_t label = 0;
+            std::array<KernelIovec, Parts> pieces;
+            pieces.fill({&label, sizeof(label)});
+            start.arrive_and_wait();
+            for (std::size_t record = 0; record < Records; ++record) {
+                label = static_cast<std::uint16_t>(worker * Records + record);
+                const auto written = worker % 2 == 0 ? sceKernelWritev(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()))
+                                                     : writev_nid_postfix(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()));
+
+                Require(written == RecordBytes);
+            }
+        });
+    }
+    for (auto& writer : writers) writer.join();
+    const auto bytes = Contents(path);
+    Require(bytes.size() == Workers * Records * RecordBytes);
+    std::array<unsigned, Workers * Records> seen{};
+    for (std::size_t offset = 0; offset < bytes.size(); offset += RecordBytes) {
+        std::array<std::uint16_t, Parts> record;
+        std::memcpy(record.data(), bytes.data() + offset, RecordBytes);
+        Require(record[0] < seen.size());
+        for (const auto label : record) {
+            if (label != record[0]) std::fprintf(stderr, "writev interleaved a record at byte %zu: %u versus %u\n", offset, static_cast<unsigned>(record[0]), static_cast<unsigned>(label));
+            Require(label == record[0]);
+        }
+        ++seen[record[0]];
+    }
+    for (const auto count : seen) Require(count == 1);
+    Require(sceKernelLseek(descriptors[0], 0, SEEK_SET) == 0);
+    std::array<std::vector<std::uint16_t>, Workers> labels;
+    std::array<std::thread, Workers> readers;
+    for (std::size_t worker = 0; worker < Workers; ++worker) {
+        readers[worker] = std::thread([&, worker] {
+            std::array<std::uint16_t, Parts> record{};
+            std::array<KernelIovec, Parts> pieces;
+            for (std::size_t part = 0; part < Parts; ++part) pieces[part] = {&record[part], sizeof(record[part])};
+            start.arrive_and_wait();
+            for (;;) {
+                const auto read = worker % 2 == 0 ? sceKernelReadv(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()))
+                                                 : readv_nid_postfix(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()));
+
+                if (read == 0) break;
+                Require(read == RecordBytes);
+                for (const auto label : record) Require(label == record[0]);
+                labels[worker].push_back(record[0]);
+            }
+        });
+    }
+    for (auto& reader : readers) reader.join();
+    seen.fill(0);
+    for (const auto& records : labels) for (const auto label : records) {
+        Require(label < seen.size());
+        ++seen[label];
+    }
+    for (const auto count : seen) Require(count == 1);
+    Require(sceKernelLseek(descriptors[0], 0, SEEK_CUR) == static_cast<std::int64_t>(bytes.size()));
+#ifdef _WIN32
+    std::array<std::thread, Workers> positioned;
+    for (std::size_t worker = 0; worker < Workers; ++worker) {
+        positioned[worker] = std::thread([&, worker] {
+            std::array<std::uint16_t, Parts> record{};
+            std::array<KernelIovec, Parts> pieces;
+            for (std::size_t part = 0; part < Parts; ++part) pieces[part] = {&record[part], sizeof(record[part])};
+            start.arrive_and_wait();
+            for (std::size_t iteration = 0; iteration < Records; ++iteration) {
+                std::int64_t transferred;
+                if (worker % 2 == 0) {
+                    record.fill(static_cast<std::uint16_t>(0x8000 + worker * Records + iteration));
+                    transferred = worker == 0 ? sceKernelPwritev(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()), 0)
+                                              : pwritev_nid_postfix(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()), 0);
+
+                } else {
+                    transferred = worker == 1 ? sceKernelPreadv(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()), 0)
+                                              : preadv_nid_postfix(descriptors[worker], pieces.data(), static_cast<int>(pieces.size()), 0);
+
+                    for (const auto label : record) Require(label == record[0]);
+                }
+                Require(transferred == RecordBytes);
+            }
+        });
+    }
+    for (auto& transfer : positioned) transfer.join();
+    Require(sceKernelLseek(descriptors[0], 0, SEEK_CUR) == static_cast<std::int64_t>(bytes.size()));
+#endif
+    for (const auto descriptor : descriptors) Require(sceKernelClose(descriptor) == 0);
+}
+
+static void LargeTransfers(const std::filesystem::path& root) {
+    constexpr std::size_t Slot = std::size_t{64} << 20;
+    constexpr std::size_t Span = 34 * Slot;
+    constexpr std::size_t Wide = 2 * Span;
+    constexpr std::size_t Gib = std::size_t{1} << 30;
+    constexpr auto Length = static_cast<std::int64_t>(Span - Slot);
+    constexpr auto Moved = static_cast<std::int64_t>(Gib);
+#ifdef _WIN32
+    const auto kernelBase = ::GetModuleHandleW(L"KernelBase.dll");
+    const auto allocate = reinterpret_cast<AllocateFunction>(::GetProcAddress(kernelBase, "VirtualAlloc2"));
+    const auto map = reinterpret_cast<MapFunction>(::GetProcAddress(kernelBase, "MapViewOfFile3"));
+    Require(allocate != nullptr && map != nullptr);
+    const HANDLE memory = ::CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(Slot), nullptr);
+    Require(memory != nullptr);
+    auto* const region = static_cast<char*>(allocate(::GetCurrentProcess(), nullptr, Wide + Gib, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+    Require(region != nullptr);
+    for (std::size_t offset = 0; offset < Wide; offset += Slot) {
+        Require(::VirtualFree(region + offset, Slot, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER));
+        Require(map(memory, ::GetCurrentProcess(), region + offset, 0, Slot, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == region + offset);
+    }
+#else
+    const auto backing = root / "large-buffer.bin";
+    const int memory = ::open(backing.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    Require(memory >= 0 && ::ftruncate(memory, static_cast<off_t>(Slot)) == 0);
+    auto* const region = static_cast<char*>(::mmap(nullptr, Wide + Gib, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    Require(region != MAP_FAILED);
+    for (std::size_t offset = 0; offset < Wide; offset += Slot) {
+        Require(::mmap(region + offset, Slot, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memory, 0) == region + offset);
+    }
+#endif
+    const auto path = (root / "large.bin").string();
+    const int file = sceKernelOpen(path.c_str(), SCE_KERNEL_O_RDWR | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0644);
+    Require(file >= 0);
+#ifdef _WIN32
+    DWORD returned = 0;
+    Require(::DeviceIoControl(reinterpret_cast<HANDLE>(::_get_osfhandle(file)), FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr));
+#endif
+    Require(sceKernelFtruncate(file, Length) == 0);
+    Require(sceKernelPwrite(file, "abcdefghijklmnop", 16, Gib - 8) == 16);
+    Require(sceKernelPwrite(file, "ABCDEFGHIJKLMNOP", 16, 2 * Gib - 8) == 16);
+
+    Require(sceKernelRead(file, region, Span) == Length);
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == Length);
+    Require(sceKernelPread(file, region, Span, Slot) == Length - static_cast<std::int64_t>(Slot));
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == Length);
+    KernelAioResult result{-1, 0};
+    KernelAioRwRequest request{0, Span, region, &result, file};
+    std::int32_t id = 0;
+    std::int32_t removed = -1;
+    Require(sceKernelAioSubmitReadCommands(&request, 1, 1, &id) == 0 && result.state == 3 && result.return_value == Length);
+    Require(sceKernelAioDeleteRequest(id, &removed) == 0 && removed == 0);
+
+    char marks[32] = {};
+    KernelIovec pieces[5] = {{region, Gib - 8}, {marks, 16}, {region, Gib - 16}, {marks + 16, 16}, {region, Span - 2 * Gib - 8}};
+    Require(sceKernelLseek(file, 0, SEEK_SET) == 0);
+    Require(sceKernelReadv(file, pieces, 5) == Length);
+    Require(std::memcmp(marks, "abcdefghijklmnopABCDEFGHIJKLMNOP", sizeof(marks)) == 0);
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == Length);
+    std::memset(marks, 0, sizeof(marks));
+    Require(sceKernelPreadv(file, pieces, 5, 0) == Length);
+    Require(std::memcmp(marks, "abcdefghijklmnopABCDEFGHIJKLMNOP", sizeof(marks)) == 0);
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == Length);
+
+    std::memcpy(marks, "0123456789ABCDEFghijklmnopqrstuv", sizeof(marks));
+    Require(sceKernelLseek(file, 0, SEEK_SET) == 0);
+    Require(sceKernelWritev(file, pieces, 5) == static_cast<std::int64_t>(Span));
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == static_cast<std::int64_t>(Span));
+    Require(sceKernelLseek(file, 0, SEEK_END) == static_cast<std::int64_t>(Span));
+    std::memset(marks, 0, sizeof(marks));
+    Require(sceKernelPread(file, marks, 16, Gib - 8) == 16 && sceKernelPread(file, marks + 16, 16, 2 * Gib - 8) == 16);
+    Require(std::memcmp(marks, "0123456789ABCDEFghijklmnopqrstuv", sizeof(marks)) == 0);
+
+    std::memcpy(region + Gib - 8, "write-whole-span", 16);
+    Require(sceKernelLseek(file, 0, SEEK_SET) == 0);
+    Require(sceKernelWrite(file, region, Span) == static_cast<std::int64_t>(Span));
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == static_cast<std::int64_t>(Span));
+    std::memset(marks, 0, sizeof(marks));
+    Require(sceKernelPread(file, marks, 16, Gib - 8) == 16 && sceKernelPread(file, marks + 16, 16, 2 * Gib - 8) == 16);
+    Require(std::memcmp(marks, "write-whole-spanwrite-whole-span", sizeof(marks)) == 0);
+    std::memcpy(region + Gib - 16, "pwrite-span-at-8", 16);
+    Require(sceKernelPwrite(file, region, Span, 8) == static_cast<std::int64_t>(Span));
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == static_cast<std::int64_t>(Span));
+    Require(sceKernelLseek(file, 0, SEEK_END) == static_cast<std::int64_t>(Span + 8));
+    std::memset(marks, 0, sizeof(marks));
+    Require(sceKernelPread(file, marks, 16, Gib - 8) == 16 && sceKernelPread(file, marks + 16, 16, 2 * Gib - 8) == 16);
+    Require(std::memcmp(marks, "pwrite-span-at-8pwrite-span-at-8", sizeof(marks)) == 0);
+
+    Require(sceKernelRead(file, region, Span) == 0);
+    Require(sceKernelPread(file, region, Span, static_cast<std::int64_t>(Span + 8)) == 0);
+    char* const tail = region + Wide - Gib;
+    Require(sceKernelLseek(file, 0, SEEK_SET) == 0);
+    Require(sceKernelRead(file, tail, 2 * Gib) == Moved);
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == Moved);
+    Require(sceKernelPread(file, tail, 2 * Gib, 0) == Moved);
+    Require(sceKernelLseek(file, 0, SEEK_SET) == 0);
+    Require(sceKernelWrite(file, tail, 2 * Gib) == Moved);
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == Moved);
+    Require(sceKernelPwrite(file, tail, 2 * Gib, 0) == Moved);
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == Moved);
+    Require(sceKernelFtruncate(file, static_cast<std::int64_t>(Wide)) == 0);
+    Require(sceKernelLseek(file, 0, SEEK_SET) == 0);
+    Require(sceKernelRead(file, region, Wide) == static_cast<std::int64_t>(Wide));
+    Require(sceKernelLseek(file, 0, SEEK_CUR) == static_cast<std::int64_t>(Wide));
+    Require(sceKernelPread(file, region, Wide, 0) == static_cast<std::int64_t>(Wide));
+    Require(sceKernelFtruncate(file, 0) == 0);
+    Require(sceKernelClose(file) == 0);
+
+    const int reader = sceKernelOpen(path.c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(reader >= 0);
+    Require(sceKernelWrite(reader, region, Span) == ErrorEbadf);
+    Require(sceKernelPwrite(reader, region, Span, 0) == ErrorEbadf);
+    Require(sceKernelClose(reader) == 0);
+    const int writer = sceKernelOpen(path.c_str(), SCE_KERNEL_O_WRONLY, 0);
+    Require(writer >= 0);
+    Require(sceKernelRead(writer, region, Span) == ErrorEbadf);
+    Require(sceKernelPread(writer, region, Span, 0) == ErrorEbadf);
+    Require(sceKernelClose(writer) == 0);
+
+    const int appender = sceKernelOpen(path.c_str(), SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_APPEND, 0);
+    Require(appender >= 0);
+    Require(sceKernelWrite(appender, "head", 4) == 4);
+    Require(sceKernelWrite(appender, tail, 2 * Gib) == Moved);
+    Require(sceKernelLseek(appender, 0, SEEK_END) == Moved + 4);
+    Require(sceKernelFtruncate(appender, 0) == 0);
+    Require(sceKernelClose(appender) == 0);
+
+#ifdef _WIN32
+    for (std::size_t offset = 0; offset < Wide; offset += Slot) Require(::UnmapViewOfFile(region + offset));
+    Require(::VirtualFree(region + Wide, 0, MEM_RELEASE) && ::CloseHandle(memory));
+#else
+    Require(::munmap(region, Wide + Gib) == 0 && ::close(memory) == 0);
+#endif
+}
+
 int main() {
     const auto root = std::filesystem::path("anyps5-file-vector-test-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Require(std::filesystem::create_directory(root));
+    ConcurrentRecords(root / "concurrent.bin");
+    LargeTransfers(root);
     const auto path = root / "data.bin";
     { std::ofstream stream(path, std::ios::binary); stream << "0123456789"; }
 
@@ -81,7 +309,7 @@ int main() {
 
     char first[3] = {};
     char second[4] = {};
-    GuestIovec reads[2] = {{first, sizeof(first)}, {second, sizeof(second)}};
+    KernelIovec reads[2] = {{first, sizeof(first)}, {second, sizeof(second)}};
     Require(sceKernelReadv(file, reads, 2) == 7);
     Require(std::memcmp(first, "012", 3) == 0 && std::memcmp(second, "3456", 4) == 0);
     Require(sceKernelLseek(file, 0, 1) == 7);
@@ -94,6 +322,8 @@ int main() {
     Require(sceKernelLseek(file, 0, 1) == 7);
     Require(readv_nid_postfix(file, reads, 2) == 3);
     Require(readv_nid_postfix(file, reads, 2) == 0);
+    Require(sceKernelLseek(file, 3, 0) == 3 && _readv_nid_postfix(file, reads, 2) == 7);
+    Require(std::memcmp(first, "345", 3) == 0 && std::memcmp(second, "6789", 4) == 0);
     Require(readv_nid_postfix(file, reads, -1) == -1 && *__error_nid_postfix() == 22);
     Require(writev_nid_postfix(file, nullptr, 1) == -1 && *__error_nid_postfix() == 14);
 
@@ -105,7 +335,7 @@ int main() {
 
     char ab[] = "AB";
     char cde[] = "CDE";
-    GuestIovec writes[2] = {{ab, 2}, {cde, 3}};
+    KernelIovec writes[2] = {{ab, 2}, {cde, 3}};
     Require(sceKernelPwritev(file, writes, 2, 2) == 5);
     Require(sceKernelLseek(file, 0, 1) == 10);
     Require(Contents(path) == "01ABCDE789");
@@ -113,13 +343,16 @@ int main() {
     Require(sceKernelWritev(file, writes, 2) == 5);
     Require(sceKernelLseek(file, 0, 1) == 13);
     Require(Contents(path) == "01ABCDE7ABCDE");
-    GuestIovec swapped[2] = {{cde, 3}, {ab, 2}};
+    KernelIovec swapped[2] = {{cde, 3}, {ab, 2}};
     Require(sceKernelLseek(file, 8, 0) == 8 && writev_nid_postfix(file, swapped, 2) == 5);
     Require(sceKernelLseek(file, 0, 1) == 13 && Contents(path) == "01ABCDE7CDEAB");
     Require(sceKernelLseek(file, 8, 0) == 8 && writev_nid_postfix(file, writes, 2) == 5);
     Require(Contents(path) == "01ABCDE7ABCDE");
+    Require(sceKernelLseek(file, 8, 0) == 8 && _writev_nid_postfix(file, swapped, 2) == 5);
+    Require(sceKernelLseek(file, 0, 1) == 13 && Contents(path) == "01ABCDE7CDEAB");
+    Require(sceKernelLseek(file, 8, 0) == 8 && writev_nid_postfix(file, writes, 2) == 5);
 
-    GuestIovec gapped[3] = {{first, 2}, {nullptr, 0}, {second, 3}};
+    KernelIovec gapped[3] = {{first, 2}, {nullptr, 0}, {second, 3}};
     Require(sceKernelPreadv(file, gapped, 3, 0) == 5);
     Require(std::memcmp(first, "01", 2) == 0 && std::memcmp(second, "ABC", 3) == 0);
     Require(sceKernelLseek(file, 2, 0) == 2);
@@ -127,7 +360,7 @@ int main() {
     Require(std::memcmp(first, "AB", 2) == 0 && std::memcmp(second, "CDE", 3) == 0);
     Require(sceKernelLseek(file, 0, 1) == 7);
 
-    GuestIovec empty[1] = {{nullptr, 0}};
+    KernelIovec empty[1] = {{nullptr, 0}};
     Require(sceKernelReadv(file, empty, 1) == 0);
     Require(sceKernelReadv(file, reads, 0) == 0);
     Require(sceKernelWritev(file, nullptr, 0) == 0);
@@ -159,12 +392,12 @@ int main() {
     Require(Contents(path) == "01ABCDE7ABCDE");
     char x[] = "X";
     char y[] = "Y";
-    GuestIovec marks[2] = {{x, 1}, {y, 1}};
+    KernelIovec marks[2] = {{x, 1}, {y, 1}};
     Require(pwritev_nid_postfix(file, marks, 2, 0) == 2);
     Require(Contents(path) == "XYABCDE7ABCDE");
     char zero[] = "0";
     char one[] = "1";
-    GuestIovec restore[2] = {{zero, 1}, {one, 1}};
+    KernelIovec restore[2] = {{zero, 1}, {one, 1}};
     Require(pwritev_nid_postfix(file, restore, 2, 0) == 2);
     Require(sceKernelLseek(file, 0, 1) == 4);
     Require(pwritev_nid_postfix(file, writes, 2, -1) == -1 && *__error_nid_postfix() == 22);
@@ -190,12 +423,22 @@ int main() {
     const int readOnly = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
     Require(readOnly >= 0);
     Require(sceKernelPwrite(readOnly, "X", 1, 0) == ErrorEbadf);
+    Require(sceKernelPwrite(readOnly, "X", 1, -1) == ErrorEbadf);
+    Require(pwrite_nid_disambig1_nid_postfix(readOnly, nullptr, 1, 0) == -1 && *__error_nid_postfix() == 9);
+    Require(sceKernelPwritev(readOnly, writes, 2, -1) == ErrorEbadf);
+    Require(pwritev_nid_postfix(readOnly, writes, 2, -1) == -1 && *__error_nid_postfix() == 9);
+    Require(sceKernelPreadv(readOnly, reads, 2, -1) == ErrorEinval);
     Require(sceKernelFtruncate(readOnly, 0) == ErrorEinval);
     Require(sceKernelClose(readOnly) == 0);
     const int writeOnly = sceKernelOpen(path.string().c_str(), SCE_KERNEL_O_WRONLY, 0);
     Require(writeOnly >= 0);
     Require(sceKernelPread(writeOnly, &byte, 1, 0) == ErrorEbadf);
     Require(pread_nid_postfix(writeOnly, &byte, 1, 0) == -1 && *__error_nid_postfix() == 9);
+    Require(sceKernelPread(writeOnly, &byte, 1, -1) == ErrorEbadf);
+    Require(pread_nid_postfix(writeOnly, nullptr, 1, 0) == -1 && *__error_nid_postfix() == 9);
+    Require(sceKernelPreadv(writeOnly, reads, 2, -1) == ErrorEbadf);
+    Require(preadv_nid_postfix(writeOnly, reads, 2, -1) == -1 && *__error_nid_postfix() == 9);
+    Require(sceKernelPwritev(writeOnly, writes, 2, -1) == ErrorEinval);
     Require(sceKernelClose(writeOnly) == 0);
     Require(Contents(path) == "01ABCDE7ABCDE");
     Require(sceKernelFtruncate(file, 5) == 0);
@@ -209,16 +452,27 @@ int main() {
     Require(sceKernelPread(file, &byte, 1, 0) == ErrorEbadf);
     Require(sceKernelPwrite(file, &byte, 1, 0) == ErrorEbadf);
     Require(sceKernelFtruncate(file, 0) == ErrorEbadf);
+    Require(sceKernelPreadv(file, reads, 2, -1) == ErrorEbadf);
+    Require(sceKernelPwritev(file, writes, 2, -1) == ErrorEbadf);
+    Require(preadv_nid_postfix(file, reads, 2, -1) == -1 && *__error_nid_postfix() == 9);
+    Require(pwritev_nid_postfix(file, writes, 2, -1) == -1 && *__error_nid_postfix() == 9);
+    KernelIovec oversized[2] = {{first, static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())}, {second, 1}};
+    Require(sceKernelReadv(file, oversized, 2) == ErrorEinval);
+    Require(sceKernelWritev(file, oversized, 2) == ErrorEinval);
+    Require(sceKernelPreadv(file, oversized, 2, 0) == ErrorEinval);
+    Require(sceKernelPwritev(file, oversized, 2, 0) == ErrorEinval);
+    Require(readv_nid_postfix(file, oversized, 2) == -1 && *__error_nid_postfix() == 22);
+    Require(pwritev_nid_postfix(file, oversized, 2, 0) == -1 && *__error_nid_postfix() == 22);
 
     int ends[2] = {};
     Require(MakePipe(ends) == 0);
     char xyz[] = "xyz";
-    GuestIovec message[1] = {{xyz, 3}};
+    KernelIovec message[1] = {{xyz, 3}};
     Require(sceKernelWritev(ends[1], message, 1) == 3);
     Require(sceKernelReadv(ends[0], reads, 2) == 3);
     Require(std::memcmp(first, "xyz", 3) == 0);
     char stuvw[] = "stuvw";
-    GuestIovec longer[1] = {{stuvw, 5}};
+    KernelIovec longer[1] = {{stuvw, 5}};
     Require(sceKernelWritev(ends[1], longer, 1) == 5);
     Require(sceKernelReadv(ends[0], reads, 2) == 5);
     Require(std::memcmp(first, "stu", 3) == 0 && std::memcmp(second, "vw", 2) == 0);
@@ -228,6 +482,10 @@ int main() {
     Require(sceKernelReadv(ends[0], reads, 2) == 3 && std::memcmp(first, "uvw", 3) == 0);
     Require(sceKernelPreadv(ends[0], reads, 2, 0) == ErrorEspipe);
     Require(sceKernelPwritev(ends[1], message, 1, 0) == ErrorEspipe);
+    Require(sceKernelPreadv(ends[0], reads, 2, -1) == ErrorEspipe);
+    Require(sceKernelPwritev(ends[1], message, 1, -1) == ErrorEspipe);
+    Require(preadv_nid_postfix(ends[0], reads, 2, -1) == -1 && *__error_nid_postfix() == 29);
+    Require(pwritev_nid_postfix(ends[1], message, 1, -1) == -1 && *__error_nid_postfix() == 29);
 #ifndef _WIN32
     Require(::fcntl(ends[0], F_SETFL, ::fcntl(ends[0], F_GETFL) | O_NONBLOCK) == 0);
     Require(sceKernelReadv(ends[0], reads, 2) == ErrorEagain);
@@ -235,10 +493,22 @@ int main() {
 #endif
     Require(ClosePipe(ends[0]) == 0 && ClosePipe(ends[1]) == 0);
 
+    const int queue = kqueue_nid_postfix();
+    Require(queue >= 0);
+    Require(sceKernelPreadv(queue, reads, 2, -1) == ErrorEspipe);
+    Require(sceKernelPwritev(queue, writes, 2, -1) == ErrorEspipe);
+    Require(preadv_nid_postfix(queue, reads, 2, -1) == -1 && *__error_nid_postfix() == 29);
+    Require(pwritev_nid_postfix(queue, writes, 2, -1) == -1 && *__error_nid_postfix() == 29);
+    Require(sceKernelPreadv(queue, reads, 2, 0) == ErrorEspipe);
+    Require(sceKernelPwritev(queue, writes, 2, 0) == ErrorEspipe);
+    Require(sceKernelPread(queue, &byte, 1, 0) == ErrorEspipe);
+    Require(pwrite_nid_disambig1_nid_postfix(queue, &byte, 1, -1) == -1 && *__error_nid_postfix() == 29);
+    Require(sceKernelClose(queue) == 0);
+
     const int random = sceKernelOpen("/dev/urandom", 0, 0);
     Require(random >= 0);
     unsigned char noise[48]{};
-    GuestIovec pieces[2] = {{noise, 16}, {noise + 16, 16}};
+    KernelIovec pieces[2] = {{noise, 16}, {noise + 16, 16}};
     Require(sceKernelReadv(random, pieces, 2) == 32);
     Require(sceKernelPreadv(random, pieces, 1, 1000) == 16);
     Require(sceKernelPread(random, noise + 32, 16, 1000) == 16);

@@ -1,13 +1,11 @@
+#include "prx/libSceAgcDriver/State/include/Configuration.hpp"
+#include "prx/libSceAgcDriver/include/AgcDriver.hpp"
 #include "SceTypes.hpp"
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 #include <thread>
-
-extern "C" {
-int APS5_VABI sceAgcDriverSetTFRing(const volatile void* base, uint32_t size);
-int APS5_VABI sceAgcDriverGetTFRing(uintptr_t* base, uint32_t* size);
-}
 
 namespace {
 
@@ -30,6 +28,45 @@ bool Rejects(TAction action) {
     return false;
 }
 
+struct OffchipOutput {
+    uint16_t granularity = 0xffff;
+    uint16_t buffering = 0xffff;
+    uint32_t canary = Canary;
+};
+
+void RequireOffchip(uint16_t expectedGranularity, uint16_t expectedBuffering) {
+    OffchipOutput output;
+    Require(sceAgcDriverGetHsOffchipParam(&output.granularity, &output.buffering) == 0);
+    Require(output.granularity == expectedGranularity && output.buffering == expectedBuffering && output.canary == Canary);
+}
+
+void CheckHsOffchipParam() {
+    RequireOffchip(0, 0);
+    Require(sceAgcDriverSetHsOffchipParam(2, 0x100) == 0);
+    RequireOffchip(2, 0x100);
+    Require(sceAgcDriverSetHsOffchipParam(3, 0x1ff) == 0);
+    RequireOffchip(3, 0x1ff);
+    Require(sceAgcDriverSetHsOffchipParam(1, 0x3ff) == 0);
+    RequireOffchip(1, 0x1ff);
+    std::thread([] { RequireOffchip(1, 0x1ff); }).join();
+    const uint16_t masked[][4] = {{4, 100, 0, 100}, {5, 100, 1, 100}, {7, 100, 3, 100}, {0xffff, 100, 3, 100},
+        {1, 512, 1, 0}, {1, 600, 1, 88}, {1, 1000, 1, 488}, {1, 1024, 1, 0}, {1, 1500, 1, 476}, {1, 2047, 1, 511}, {1, 0xffff, 1, 511}};
+    for (const auto& value : masked) {
+        Require(sceAgcDriverSetHsOffchipParam(value[0], value[1]) == 0);
+        RequireOffchip(value[2], value[3]);
+    }
+    Require(sceAgcDriverSetHsOffchipParam(0, 0) == 0);
+    RequireOffchip(0, 0);
+    OffchipOutput output;
+    Require(Rejects([&] { sceAgcDriverGetHsOffchipParam(nullptr, &output.buffering); }));
+    Require(Rejects([&] { sceAgcDriverGetHsOffchipParam(&output.granularity, nullptr); }));
+    errno = 71;
+    Require(Rejects([&] { sceAgcDriverGetHsOffchipParam(reinterpret_cast<uint16_t*>(0x10), &output.buffering); }));
+    Require(errno == 71);
+    Require(Rejects([&] { sceAgcDriverGetHsOffchipParam(&output.granularity, reinterpret_cast<uint16_t*>(0x10)); }));
+    Require(errno == 71);
+}
+
 void RequireRing(uintptr_t expectedBase, uint32_t expectedSize) {
     RingOutput output;
     Require(sceAgcDriverGetTFRing(&output.base, &output.size) == 0);
@@ -39,6 +76,7 @@ void RequireRing(uintptr_t expectedBase, uint32_t expectedSize) {
 }
 
 int main() {
+    CheckHsOffchipParam();
     alignas(256) static uint8_t ring[0x20000];
     const auto ringBase = reinterpret_cast<uintptr_t>(ring);
     RequireRing(0xff0000000, 0x20000);
@@ -53,4 +91,9 @@ int main() {
     RingOutput output;
     Require(Rejects([&] { sceAgcDriverGetTFRing(nullptr, &output.size); }));
     Require(Rejects([&] { sceAgcDriverGetTFRing(&output.base, nullptr); }));
+    errno = 71;
+    Require(Rejects([&] { sceAgcDriverGetTFRing(reinterpret_cast<uintptr_t*>(0x10), &output.size); }));
+    Require(errno == 71);
+    Require(Rejects([&] { sceAgcDriverGetTFRing(&output.base, reinterpret_cast<uint32_t*>(0x10)); }));
+    Require(errno == 71);
 }

@@ -114,7 +114,8 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         next.runtimeStateDwords = (attributes + RuntimeAbi::VertexSelectorsPerDword - 1u) / RuntimeAbi::VertexSelectorsPerDword;
     }
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
-    next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
+    const auto dataSize = stencilReplay && pushSize != 0u ? pushSize - 1u : pushSize;
+    next.pushDataStartDword = next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= dataSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
     if (stencilReplay) {
         const auto offset = next.UsesPushData() ? next.ShaderDataDwords() : 0u;
         if (offset >= pushSize) fail("stencil replay requires an unused push constant dword");
@@ -160,7 +161,7 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         }
     }
     if (!samplers.empty()) {
-        if (samplers.size() > RuntimeAbi::SamplerHeapCapacity) fail("shader sampler pairs exceed runtime heap capacity");
+        if (samplers.size() > RuntimeAbi::SamplerHeapCapacity) fail("shader sampler pairs exceed runtime heap capacity: " + std::to_string(samplers.size() / 2u) + " samplers");
         addBinding(next, DescriptorBindingKind::Samplers, std::move(samplers));
     }
     if (usesGds(program)) {
@@ -186,6 +187,9 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     }
     if (imageTables) {
         addBinding(next, DescriptorBindingKind::ImageTable);
+    }
+    if (std::ranges::any_of(info.images, [](const ImageResource& image) { return image.table != NoTable && image.resourceClass == ImageResourceClass::Storage && image.tableOperation == TableOperation::Supported; })) {
+        addBinding(next, DescriptorBindingKind::ImageStorageTable);
     }
 
     if (next.ShaderDataDwords() != 0u && !next.UsesPushData()) {

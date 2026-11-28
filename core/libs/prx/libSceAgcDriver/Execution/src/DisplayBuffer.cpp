@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HalfFloatScanout.hpp"
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -39,7 +41,19 @@ std::uint32_t tileOffset64(std::uint32_t x, std::uint32_t y) {
     return ((x << 3u) & 0x0008u) ^ ((x << 4u) & 0x0460u) ^ ((x << 5u) & 0x0300u) ^ ((x << 6u) & 0x0800u) ^ ((x << 9u) & 0x8000u) ^ ((x << 10u) & 0x2000u) ^ ((y << 4u) & 0x0010u) ^ ((y << 6u) & 0x0080u) ^ ((y << 5u) & 0x0f00u) ^ ((y << 10u) & 0x5000u);
 }
 
+const Graphics::ColorTargetLayout& gcnLayout(const DisplayBuffer& buffer, std::uint32_t texelBytes) {
+    thread_local std::optional<Graphics::ColorTargetLayout> layout;
+    thread_local std::array<std::uint32_t, 3> key{};
+    const std::array<std::uint32_t, 3> wanted{buffer.pitchInPixel, buffer.height, texelBytes};
+    if (!layout || key != wanted) {
+        layout.emplace(buffer.pitchInPixel, buffer.height, Graphics::ColorTileMode::GcnDisplay2D, texelBytes);
+        key = wanted;
+    }
+    return *layout;
+}
+
 std::size_t texelOffset(const DisplayBuffer& buffer, std::uint32_t x, std::uint32_t y, std::uint32_t texelBytes) {
+    if (buffer.tilingMode == DisplayTilingGcn) return gcnLayout(buffer, texelBytes).Offset(x, y);
     if (buffer.tilingMode == 1) {
         const auto pitch = buffer.pitchInPixel == 0 ? buffer.width : buffer.pitchInPixel;
         return (static_cast<std::size_t>(y) * pitch + x) * texelBytes;
@@ -130,8 +144,14 @@ std::size_t DisplayBufferSize(const DisplayBuffer& buffer) {
         throw std::runtime_error(message);
     }
     require(!halfFloat || buffer.dccAddress == 0, "VideoOut: DCC metadata on a 16-bit float display buffer is not implemented");
-    require(buffer.address != 0 && (buffer.address & 65535u) == 0, "VideoOut: display buffer requires 64 KiB alignment");
-    require(buffer.tilingMode <= 1, "VideoOut: unsupported display tiling mode");
+    require(buffer.alignment == 65536u || (buffer.alignment == 4096u && (buffer.tilingMode == 1 || buffer.tilingMode == DisplayTilingGcn)), "VideoOut: 4 KiB display buffer alignment is only supported for linear and PS4 buffers");
+    require(buffer.address != 0 && (buffer.address & (buffer.alignment - 1u)) == 0, buffer.alignment == 65536u ? "VideoOut: display buffer requires 64 KiB alignment" : "VideoOut: display buffer requires 4 KiB alignment");
+    require(buffer.tilingMode <= 1 || buffer.tilingMode == DisplayTilingGcn, "VideoOut: unsupported display tiling mode");
+    if (buffer.tilingMode == DisplayTilingGcn) {
+        require(buffer.dccAddress == 0 && !DisplayHalfFloat(buffer.pixelFormat), "VideoOut: PS4 display buffers carry no DCC and no half-float texels");
+        require(buffer.pitchInPixel >= buffer.width && buffer.pitchInPixel % 128u == 0, "VideoOut: PS4 tiled display pitch is not padded to 128 pixels");
+        return gcnLayout(buffer, DisplayTexelBytes(buffer.pixelFormat)).Bytes();
+    }
     require(buffer.tilingMode != 0 || buffer.pitchInPixel == 0, "VideoOut: tiled display pitch is unsupported");
     require(buffer.dccAddress == 0 || buffer.tilingMode == 0, "VideoOut: a linear display buffer cannot carry DCC metadata");
     require(buffer.dccAddress != 0 || buffer.dccClearColor == 0, "VideoOut: a DCC clear color needs DCC metadata");
@@ -164,7 +184,6 @@ std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::spa
         timing.Mark("detile_convert");
         return pixels;
     }
-    const auto blocksPerRow = (buffer.width + 127u) / 128u;
     const bool rgba = DisplayRedLow(buffer.pixelFormat);
     const bool pq = DisplayPq(buffer.pixelFormat);
     const float whiteNits = pq ? PqToSdrWhiteNits(AgcDriver::CurrentHostHdr()) : 0.0f;
@@ -174,9 +193,7 @@ std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::spa
     timing.Mark("validate_allocate");
     for (std::uint32_t y = 0; y < buffer.height; ++y) {
         for (std::uint32_t x = 0; x < buffer.width; ++x) {
-            const auto pitch = buffer.pitchInPixel == 0 ? buffer.width : buffer.pitchInPixel;
-            const auto tiled = buffer.tilingMode == 1 ? (static_cast<std::size_t>(y) * pitch + x) * 4u
-                : (static_cast<std::size_t>(y / 128u) * blocksPerRow + x / 128u) * 65536u + tileOffset(x, y);
+            const auto tiled = texelOffset(buffer, x, y, 4u);
             const auto linear = (static_cast<std::size_t>(y) * buffer.width + x) * 4;
             decodeTexel(source.data() + tiled, pixels.data() + linear, rgba, tenBit, pq, whiteNits);
         }
@@ -249,7 +266,7 @@ std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
         std::fprintf(stderr, "[gpu] scanout display buffer 0x%llx %ux%u format 0x%016llx at %.1f s\n", static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, static_cast<unsigned long long>(buffer.pixelFormat), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     }
     GuestMemory::FlushGpuWrites(buffer.address, size);
-    GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, buffer.alignment);
     const auto* source = reinterpret_cast<const std::byte*>(buffer.address);
     return DecodeDisplayBuffer(buffer, {source, size});
 }
@@ -267,7 +284,7 @@ std::vector<std::byte> DisplayBufferTexels(const DisplayBuffer& buffer, std::spa
 std::vector<std::byte> ReadDisplayBufferTexels(const DisplayBuffer& buffer) {
     const auto size = DisplayBufferSize(buffer);
     GuestMemory::FlushGpuWrites(buffer.address, size);
-    GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, buffer.alignment);
     return DisplayBufferTexels(buffer, {reinterpret_cast<const std::byte*>(buffer.address), size});
 }
 

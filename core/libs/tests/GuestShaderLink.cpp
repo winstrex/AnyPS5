@@ -1,14 +1,15 @@
+#include "prx/libSceAgc/Shader/include/LinkShaders.hpp"
+#include "prx/libSceAgc/Misc/include/RegisterDefaults.hpp"
 #include "SceShaders.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <span>
-extern "C" int APS5_VABI sceAgcLinkShaders(ShaderRegister*, ShaderRegister*, const void*, const Shader*, const Shader*, std::uint32_t);
-extern "C" void* APS5_VABI sceAgcGetRegisterDefaults();
-extern "C" void* APS5_VABI sceAgcGetRegisterDefaults2(std::uint32_t);
+
 static void Require(bool value) { if (!value) std::abort(); }
 static unsigned preparations = 0;
 static unsigned mappings = 0;
@@ -36,14 +37,16 @@ int main() {
     using namespace ShaderRegs;
     auto* defaults = static_cast<unsigned char*>(sceAgcGetRegisterDefaults());
     Require(defaults && defaults == sceAgcGetRegisterDefaults());
-    Require(defaults == sceAgcGetRegisterDefaults2(0));
+    auto* versionedDefaults = static_cast<unsigned char*>(sceAgcGetRegisterDefaults2(13));
+    Require(versionedDefaults != nullptr);
+    Require(std::memcmp(defaults + 0x20, versionedDefaults + 0x20, 4 * sizeof(std::uint32_t)) == 0);
     // These are the byte offsets used by native callers, independent of the
     // private C++ structure used to construct the defaults object.
     ShaderRegister** contextBlocks = nullptr;
     std::uint32_t contextCount = 0;
     std::memcpy(&contextBlocks, defaults, sizeof(contextBlocks));
     std::memcpy(&contextCount, defaults + 0x20, sizeof(contextCount));
-    Require(contextBlocks && contextBlocks[0] && contextCount == 523);
+    Require(contextBlocks && contextBlocks[0] && contextCount == 488);
     bool hasRenderTarget = false;
     bool hasRasterizer = false;
     for (std::uint32_t i = 0; i < contextCount; ++i) {
@@ -76,6 +79,15 @@ int main() {
     Require(context.back().value == 0xcafebabe && primitive.back().value == 0xcafebabe);
     const auto savedContext = context;
     const auto savedPrimitive = primitive;
+    auto* const unmappedRegisters = reinterpret_cast<ShaderRegister*>(0x10);
+    const auto* const unmappedShader = reinterpret_cast<const Shader*>(0x10);
+    errno = 71;
+    Require(sceAgcLinkShaders(unmappedRegisters, primitive.data(), nullptr, &vertex, &pixel, 4) == GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM && errno == 71);
+    Require(sceAgcLinkShaders(context.data(), unmappedRegisters, nullptr, &vertex, &pixel, 4) == GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM && errno == 71);
+    Require(sceAgcLinkShaders(context.data(), primitive.data(), nullptr, unmappedShader, &pixel, 4) == GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM && errno == 71);
+    Require(sceAgcLinkShaders(context.data(), primitive.data(), nullptr, &vertex, unmappedShader, 4) == GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM && errno == 71);
+    Require(std::memcmp(context.data(), savedContext.data(), sizeof(context)) == 0);
+    Require(std::memcmp(primitive.data(), savedPrimitive.data(), sizeof(primitive)) == 0);
     pixel.num_input_semantics = 33;
     Require(sceAgcLinkShaders(context.data(), primitive.data(), nullptr, &vertex, &pixel, 4) == GRAPHICS5_ERROR_INVALID_SHADER_PROGRAM);
     Require(std::memcmp(context.data(), savedContext.data(), sizeof(context)) == 0);

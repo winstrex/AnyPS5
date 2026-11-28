@@ -1,4 +1,10 @@
+#include "prx/libc/include/Api.hpp"
+#include "prx/libc/include/ScanQuadLength.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -9,37 +15,6 @@ extern "C" {
 extern const unsigned char _DefaultRuneLocale_nid_postfix[4224];
 extern const unsigned char* _CurrentRuneLocale_nid_postfix;
 extern int __mb_sb_limit_nid_postfix;
-int APS5_VABI isalpha_nid_postfix(int);
-int APS5_VABI iscntrl_nid_postfix(int);
-int APS5_VABI isdigit_nid_postfix(int);
-int APS5_VABI isgraph_nid_postfix(int);
-int APS5_VABI islower_nid_postfix(int);
-int APS5_VABI isprint_nid_postfix(int);
-int APS5_VABI ispunct_nid_postfix(int);
-int APS5_VABI isspace_nid_postfix(int);
-int APS5_VABI isupper_nid_postfix(int);
-int APS5_VABI isxdigit_nid_postfix(int);
-int APS5_VABI isblank_nid_postfix(int);
-int APS5_VABI tolower_nid_postfix(int);
-int APS5_VABI toupper_nid_postfix(int);
-int APS5_VABI iswalnum_nid_postfix(std::uint32_t);
-int APS5_VABI iswalpha_nid_postfix(std::uint32_t);
-int APS5_VABI iswblank_nid_postfix(std::uint32_t);
-int APS5_VABI iswcntrl_nid_postfix(std::uint32_t);
-int APS5_VABI iswdigit_nid_postfix(std::uint32_t);
-int APS5_VABI iswgraph_nid_postfix(std::uint32_t);
-int APS5_VABI iswlower_nid_postfix(std::uint32_t);
-int APS5_VABI iswprint_nid_postfix(std::uint32_t);
-int APS5_VABI iswpunct_nid_postfix(std::uint32_t);
-int APS5_VABI iswspace_nid_postfix(std::uint32_t);
-int APS5_VABI iswupper_nid_postfix(std::uint32_t);
-int APS5_VABI iswxdigit_nid_postfix(std::uint32_t);
-int APS5_VABI iswctype_nid_postfix(std::uint32_t, std::uint64_t);
-std::uint64_t APS5_VABI wctype_nid_postfix(const char*);
-std::uint32_t APS5_VABI towlower_nid_postfix(std::uint32_t);
-std::uint32_t APS5_VABI towupper_nid_postfix(std::uint32_t);
-std::uint32_t APS5_VABI btowc_nid_postfix(int);
-int APS5_VABI wctob_nid_postfix(std::uint32_t);
 }
 
 void Require(bool condition, std::source_location location = std::source_location::current()) {
@@ -56,7 +31,47 @@ T Field(const unsigned char* locale, std::size_t offset) {
     return value;
 }
 
+void TestRegexNames() {
+    const struct {
+        const char* name;
+        std::uint64_t caseSensitive;
+        std::uint64_t caseInsensitive;
+    } classes[] = {
+        {"alnum", 0x500, 0x500}, {"alpha", 0x100, 0x100}, {"blank", 0x20000, 0x20000},
+        {"cntrl", 0x200, 0x200}, {"d", 0x400, 0x400}, {"digit", 0x400, 0x400},
+        {"graph", 0x2500, 0x2500}, {"lower", 0x1000, 0x1100}, {"print", 0x40000, 0x40000},
+        {"punct", 0x2000, 0x2000}, {"s", 0x4000, 0x4000}, {"space", 0x4000, 0x4000},
+        {"upper", 0x8000, 0x8100}, {"w", 0x9580, 0x9580}, {"xdigit", 0x10000, 0x10000},
+        {"", 0, 0}, {"Alpha", 0, 0}, {"number", 0, 0}, {"xdigits", 0, 0},
+    };
+    for (const auto& entry : classes) {
+        Require(_ZNSt3__115__get_classnameEPKcb_nid_postfix(entry.name, false) == entry.caseSensitive);
+        Require(_ZNSt3__115__get_classnameEPKcb_nid_postfix(entry.name, true) == entry.caseInsensitive);
+    }
+
+    const struct {
+        const char* name;
+        unsigned char size;
+        unsigned char character;
+    } collationNames[] = {
+        {"A", 1, 'A'}, {"a", 1, 'a'}, {"NUL", 1, 0}, {"newline", 1, '\n'},
+        {"left-square-bracket", 1, '['}, {"right-square-bracket", 1, ']'},
+        {"period", 1, '.'}, {"full-stop", 1, '.'}, {"solidus", 1, '/'},
+        {"zero", 1, '0'}, {"0", 0, 0}, {"", 0, 0}, {"nul", 0, 0},
+        {"right-square-brackets", 0, 0}, {"right-square-bracke", 0, 0},
+    };
+    for (const auto& entry : collationNames) {
+        alignas(8) std::array<unsigned char, 26> result;
+        result.fill(0xff);
+        Require(_ZNSt3__120__get_collation_nameEPKc_nid_postfix(result.data(), entry.name) == result.data());
+        Require(result[0] == (entry.size << 1) && result[1] == entry.character);
+        Require(std::all_of(result.begin() + 2, result.begin() + 24, [](unsigned char byte) { return byte == 0; }));
+        Require(result[24] == 0xff && result[25] == 0xff);
+    }
+}
+
 int main() {
+    TestRegexNames();
     const unsigned char* locale = _DefaultRuneLocale_nid_postfix;
     Require(_CurrentRuneLocale_nid_postfix == locale);
     Require(__mb_sb_limit_nid_postfix == 256);
@@ -112,6 +127,10 @@ int main() {
         }
         Require(entry.wide(0xffffffff) == 0 && iswctype_nid_postfix(0xffffffff, entry.mask) == 0);
     }
+    for (std::uint32_t c = 0; c < 300; ++c) {
+        Require((iswascii_nid_postfix(c) != 0) == (c <= 0x7f));
+    }
+    Require(iswascii_nid_postfix(0xffffffff) == 0);
     Require(wctype_nid_postfix("ideogram") == 0x80000 && wctype_nid_postfix("special") == 0x100000);
     Require(wctype_nid_postfix("phonogram") == 0x200000 && wctype_nid_postfix("number") == 0x400000);
     Require(wctype_nid_postfix("rune") == 0xffffff00 && wctype_nid_postfix("") == 0 && wctype_nid_postfix("Alpha") == 0);
@@ -122,8 +141,61 @@ int main() {
     }
     Require(towlower_nid_postfix(0xffffffff) == 0xffffffff && towupper_nid_postfix(0xffffffff) == 0xffffffff);
     Require(btowc_nid_postfix(-1) == 0xffffffff && btowc_nid_postfix(0) == 0);
-    Require(btowc_nid_postfix('A') == 'A' && btowc_nid_postfix(0xe9) == 0xe9 && btowc_nid_postfix(-23) == 0xe9);
-    Require(wctob_nid_postfix('A') == 'A' && wctob_nid_postfix(0xe9) == 0xe9 && wctob_nid_postfix(0) == 0);
-    Require(wctob_nid_postfix(0x100) == -1 && wctob_nid_postfix(0x20ac) == -1 && wctob_nid_postfix(0xffffffff) == -1);
+    Require(btowc_nid_postfix('A') == 'A' && btowc_nid_postfix(0x7f) == 0x7f && btowc_nid_postfix(0x80) == 0xffffffff);
+    Require(btowc_nid_postfix(0xe9) == 0xffffffff && btowc_nid_postfix(-23) == 0xffffffff && btowc_nid_postfix(0x141) == 'A');
+    Require(wctob_nid_postfix('A') == 'A' && wctob_nid_postfix(0x7f) == 0x7f && wctob_nid_postfix(0x80) == -1 && wctob_nid_postfix(0) == 0);
+    Require(wctob_nid_postfix(0xe9) == -1 && wctob_nid_postfix(0x20ac) == -1 && wctob_nid_postfix(0xffffffff) == -1);
+    Require(wctob_nid_postfix(0x10041) == 'A' && wctob_nid_postfix(0x80000000) == 0);
+    Require(wctrans_nid_postfix("tolower") == 1 && wctrans_nid_postfix("toupper") == 2);
+    Require(wctrans_nid_postfix("") == 0 && wctrans_nid_postfix("TOLOWER") == 0 && wctrans_nid_postfix("tolowe") == 0);
+    for (std::int64_t c = -300; c < 70000; ++c) {
+        const auto wide = static_cast<std::uint32_t>(c);
+        const bool ascii = c >= 0 && c < 128;
+        const auto lower = ascii ? static_cast<std::uint32_t>(std::tolower(static_cast<int>(c))) : wide;
+        const auto upper = ascii ? static_cast<std::uint32_t>(std::toupper(static_cast<int>(c))) : wide;
+        Require(towctrans_nid_postfix(wide, 1) == lower && towctrans_nid_postfix(wide, 2) == upper);
+        Require(_Towlower_nid_postfix(wide, nullptr) == lower && _Towupper_nid_postfix(wide, nullptr) == upper);
+        Require(_Tolower_nid_postfix(static_cast<int>(c), nullptr) == static_cast<int>(lower));
+        Require(_Toupper_nid_postfix(static_cast<int>(c), nullptr) == static_cast<int>(upper));
+    }
+    errno = 0;
+    Require(towctrans_nid_postfix('A', 0) == 'A' && towctrans_nid_postfix('a', 3) == 'a' && errno == 0);
+    for (int c = -300; c < 0x1200; ++c) {
+        const auto byte = static_cast<unsigned char>(c);
+        errno = 0;
+        const std::uint32_t wide = btowc_nid_postfix(c);
+        const bool invalidLead = c != -1 && ((byte >= 0x80 && byte < 0xc0) || byte >= 0xf0);
+        Require(wide == (c != -1 && byte < 0x80 ? byte : 0xffffffffu) && errno == (invalidLead ? 86 : 0));
+    }
+    errno = 7;
+    Require(btowc_nid_postfix(0xc3) == 0xffffffff && btowc_nid_postfix(0xef) == 0xffffffff && btowc_nid_postfix(-1) == 0xffffffff && errno == 7);
+    Require(btowc_nid_postfix(0x41) == 'A' && errno == 7);
+
+    const char* const posQuad = "%1$qd";
+    Require(LibcDetail::FindQuadScanDirective(posQuad) == posQuad);
+    const char* const posWidthQuad = "%12$*8qx";
+    Require(LibcDetail::FindQuadScanDirective(posWidthQuad) == posWidthQuad);
+    const char* const groupQuad = "%'qd";
+    Require(LibcDetail::FindQuadScanDirective(groupQuad) == groupQuad);
+    const char* const stackedQuad = "%lqd";
+    Require(LibcDetail::FindQuadScanDirective(stackedQuad) == stackedQuad);
+    const char* const secondPosQuad = "%d %2$qd";
+    Require(LibcDetail::FindQuadScanDirective(secondPosQuad) == secondPosQuad + 3);
+    const char* const scanSetThenQuad = "%1$[^]%q]%2$qd";
+    Require(LibcDetail::FindQuadScanDirective(scanSetThenQuad) == scanSetThenQuad + 9);
+
+    Require(LibcDetail::FindQuadScanDirective("%1$[%q]%2$d") == nullptr);
+    Require(LibcDetail::FindQuadScanDirective("%'[%q]%d") == nullptr);
+    Require(LibcDetail::FindQuadScanDirective("%m[%q]%d") == nullptr);
+    Require(LibcDetail::FindQuadScanDirective("%dq") == nullptr);
+
+    std::int64_t quadOut = 0x1122334455667788LL;
+    Require(sscanf_nid_postfix("42", "%1$qd", &quadOut) == 0);
+    Require(quadOut == 0x1122334455667788LL);
+    Require(sscanf_nid_postfix("42", "%lqd", &quadOut) == 0);
+    Require(quadOut == 0x1122334455667788LL);
+    int firstOut = 0;
+    Require(sscanf_nid_postfix("7 42", "%d %lqd", &firstOut, &quadOut) == 1);
+    Require(firstOut == 7 && quadOut == 0x1122334455667788LL);
     return 0;
 }

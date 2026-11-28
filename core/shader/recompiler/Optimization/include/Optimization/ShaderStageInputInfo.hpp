@@ -60,13 +60,8 @@ struct ShaderVertexDestination {
     std::uint32_t fetchIndex = 0;
 };
 
-struct ShaderStageRuntime {
-    const CompiledShaderInfo* program = nullptr;
-    ResourceSnapshot resources;
-
-    [[nodiscard]] explicit operator bool() const {
-        throw std::runtime_error("shader input helper not implemented");
-    }
+struct ShaderDepthRemap {
+    std::uint32_t mode = 0;
 };
 
 struct ShaderClipSpaceTransform {
@@ -92,6 +87,8 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
     std::uint32_t maxPrimitives = 0;
     std::uint32_t provokingVertex = 0;
     std::uint32_t esgsItemSize = 0;
+    std::uint32_t outputPrimitiveSize = 3;
+    bool capturedInput = false;
 
     [[nodiscard]] std::uint32_t InputPrimitiveSize() const {
         return inputPrimitive == 1u ? 1u : inputPrimitive == 2u ? 2u : 3u;
@@ -118,6 +115,8 @@ struct ShaderTessellationInputInfo {
     bool breakAtInstance = false;
     std::uint32_t instancePatches = 0;
     bool drawParameters = false;
+    bool mergedHull = false;
+    std::uint32_t geometryItemDwords = 0;
 };
 
 struct ShaderVertexInputInfo {
@@ -126,7 +125,6 @@ struct ShaderVertexInputInfo {
     ShaderBufferResource resources[MaxResources];
     ShaderVertexDestination resourcesDst[MaxResources];
     ShaderVertexInputBuffer buffers[MaxResources];
-    ShaderStageRuntime stage;
     IrShaderStage logicalStage = IrShaderStage::Vertex;
     int resourcesNum = 0;
     int fetchAttribReg = 0;
@@ -135,7 +133,12 @@ struct ShaderVertexInputInfo {
     std::uint32_t scratchSizeDwords = 0;
     std::uint32_t hostSubgroupSize = 64;
     std::uint32_t paClVsOutCntl = 0;
+    bool pointList = false;
+    float pointSize = 1.0f;
+    float pointSizeMin = 0.0f;
+    float pointSizeMax = 0.0f;
     ShaderClipSpaceTransform clipSpace;
+    ShaderDepthRemap depthRemap;
     ShaderMeshInputInfo mesh;
     ShaderTessellationInputInfo tess;
     bool fetchExternal = false;
@@ -148,7 +151,6 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
     int threadIdsNum = 0;
     int workgroupRegister = 0;
     bool tgSizeEn = false;
-    ShaderStageRuntime stage;
 };
 
 struct ShaderPixelInputInfo {
@@ -173,8 +175,11 @@ struct ShaderPixelInputInfo {
     bool psNoPerspective = false;
     bool psPixelKillEnable = false;
     bool psDepthExportEnable = false;
+    float psDepthExportMin = 0.0f;
+    float psDepthExportMax = 1.0f;
     bool psSampleMaskExportEnable = false;
     bool psStencilRefExportEnable = false;
+    bool psStencilOperationValueExport = false;
     bool psSampleShading = false;
     bool psEarlyZ = false;
     bool psExecuteOnNoop = false;
@@ -182,12 +187,36 @@ struct ShaderPixelInputInfo {
     bool psOrderedPixelShader = false;
     bool psAlphaToCoverage = false;
     bool psDitheredAlphaToCoverage = false;
+    std::uint8_t psDitheredAlphaSamples = 8;
+    SingleSampleDither psSingleSampleDither = SingleSampleDither::None;
     std::uint8_t quadPixelMask = 0xf;
     std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
-    ShaderStageRuntime stage;
+    bool psIteratesSamples = false;
+    PixelPositionLocation psPositionLocation = PixelPositionLocation::Center;
+    std::array<std::uint8_t, 32> sampleLocations{};
+    std::vector<TargetMerge> merges;
+    std::uint8_t mergeSamples = 1;
+    bool mergeDepthStencilWrites = false;
+    bool mergeDepthStencilTests = false;
+    std::array<std::uint32_t, 4> sampleOrder{};
 
     bool HasPositionInput() const {
         return psPosX || psPosY || psPosZ || psPosW;
+    }
+
+    [[nodiscard]] bool SampleLocationsOffCenter() const {
+        return std::ranges::any_of(sampleLocations, [](std::uint8_t location) { return location != 0u; });
+    }
+
+    [[nodiscard]] bool SampleLocationsVary() const {
+        for (std::size_t index = 8; index < sampleLocations.size(); ++index) {
+            if (sampleLocations[index] != sampleLocations[index % 8u]) return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool ReordersSamples() const {
+        return std::ranges::any_of(sampleOrder, [](std::uint32_t order) { return order != 0u && order != 0x76543210u; });
     }
 
     [[nodiscard]] bool QuadSampleMaskPartial() const {

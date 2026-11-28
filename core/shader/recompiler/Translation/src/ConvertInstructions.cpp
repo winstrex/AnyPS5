@@ -1,13 +1,8 @@
-#include "Translation/ConvertInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <cstdint>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
-
-void TranslateConvertInstruction(IrBuilder& builder, const RdnaInstruction& instruction) {
-    throw std::runtime_error("TranslateConvertInstruction not implemented");
-}
 
 IrF32 TranslationContext::selectF32(IrU1 condition, IrF32 trueValue, IrF32 falseValue) {
     return IrF32(ir.Select(condition.Value(), trueValue.Value(), falseValue.Value()));
@@ -124,7 +119,14 @@ void TranslationContext::vCvtF16F32(const RdnaInstruction& inst) {
 
 void TranslationContext::vCvtF32F16(const RdnaInstruction& inst) {
     const IrF32 value = flushF16InputValue(readF16AsF32(sourceAt(inst, 0u)));
-    writeOperand(inst.destination, &value.Value());
+    if (!ieeeMode) {
+        writeOperand(inst.destination, &value.Value());
+        return;
+    }
+    const IrU32 bits(ir.BitCastU32(value.Value()));
+    const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
+    const IrF32 quieted(ir.BitCastF32(ir.Select(nan.Value(), quietNan32(bits).Value(), bits.Value())));
+    writeOperand(inst.destination, &quieted.Value());
 }
 
 void TranslationContext::vCvtF1616(const RdnaInstruction& inst, bool signedValue) {
@@ -196,9 +198,14 @@ void TranslationContext::vCvtOffF32I4(const RdnaInstruction& inst) {
 }
 
 void TranslationContext::vCvtPkrtzF16F32(const RdnaInstruction& inst) {
-    const IrF32 lhs(*readOperand(sourceAt(inst, 0u), IrType::F32));
-    const IrF32 rhs(*readOperand(sourceAt(inst, 1u), IrType::F32));
-    const IrU32 result(ir.Emit(IrOpcode::PackFloat2x16Rtz, IrType::U32, {&lhs.Value(), &rhs.Value()}));
+    const IrF32 lhs(ir.BitCastF32(readU32(sourceAt(inst, 0u)).Value()));
+    const IrF32 rhs(ir.BitCastF32(readU32(sourceAt(inst, 1u)).Value()));
+    IrU32 result(ir.Emit(IrOpcode::PackFloat2x16Rtz, IrType::U32, {&lhs.Value(), &rhs.Value()}));
+    if (floatMode.has_value() && (floatMode->floatMode & 0x80u) == 0u) {
+        const IrU32 low = flushF16Result(IrU32(ir.BitwiseAnd(result.Value(), ir.Constant(0xffffu))));
+        const IrU32 high = flushF16Result(IrU32(ir.ShiftRightLogical(result.Value(), ir.Constant(16u))));
+        result = packU16Lanes(low, high);
+    }
     writeOperand(inst.destination, &result.Value());
 }
 
@@ -210,15 +217,22 @@ void TranslationContext::vCvtPknormF32(const RdnaInstruction& inst, bool signedV
 }
 
 void TranslationContext::vCvtPkU8F32(const RdnaInstruction& inst) {
-    const IrF32 source(ir.BitCastF32(*readOperand(sourceAt(inst, 0u), IrType::U32)));
+    const IrU32 bits = flushF32Denormal(IrU32(*readOperand(sourceAt(inst, 0u), IrType::U32)));
+    const IrF32 source(ir.BitCastF32(bits.Value()));
     const IrF32 zero(ir.ConstantF32(0.0f));
     const IrU1 nan(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&source.Value()}));
     const IrU1 low(ir.Emit(IrOpcode::FPOrdLessThanEqual32, IrType::U1, {&source.Value(), &zero.Value()}));
     const IrU1 high(ir.Emit(IrOpcode::FPOrdGreaterThanEqual32, IrType::U1, {&source.Value(), &ir.ConstantF32(255.0f)}));
-    const IrF32 rounded(ir.Emit(IrOpcode::FPRoundEven32, IrType::F32, {&source.Value()}));
+    const std::uint32_t roundMode = floatMode.has_value() ? floatMode->floatMode & 3u : 0u;
+    const IrOpcode rounding = roundMode == 1u ? IrOpcode::FPCeil32 : roundMode == 2u ? IrOpcode::FPFloor32 : roundMode == 3u ? IrOpcode::FPTrunc32 : IrOpcode::FPRoundEven32;
+    const IrF32 rounded(ir.Emit(rounding, IrType::F32, {&source.Value()}));
     const IrF32 bounded = selectF32(high, IrF32(ir.ConstantF32(255.0f)), rounded);
     const IrF32 safe = selectF32(IrU1(ir.LogicalOr(nan.Value(), low.Value())), zero, bounded);
-    const IrU32 byteValue(ir.Emit(IrOpcode::ConvertU32F32, IrType::U32, {&safe.Value()}));
+    IrU32 byteValue(ir.Emit(IrOpcode::ConvertU32F32, IrType::U32, {&safe.Value()}));
+    if (roundMode == 1u && (f32DenormalFlush & 1u) == 0u) {
+        const IrU1 positiveDenormal(ir.ULessThan(ir.ISub(bits.Value(), ir.Constant(1u)), ir.Constant(0x007fffffu)));
+        byteValue = IrU32(ir.Select(positiveDenormal.Value(), ir.Constant(1u), byteValue.Value()));
+    }
     const IrU32 index(ir.BitwiseAnd(readU32(sourceAt(inst, 1u)).Value(), ir.Constant(3u)));
     const IrU32 shift(ir.ShiftLeftLogical(index.Value(), ir.Constant(3u)));
     const IrU32 mask(ir.ShiftLeftLogical(ir.Constant(0xffu), shift.Value()));
@@ -229,7 +243,7 @@ void TranslationContext::vCvtPkU8F32(const RdnaInstruction& inst) {
 
 void TranslationContext::vPackB32F16(const RdnaInstruction& inst) {
     const auto half = [&](std::uint32_t index) {
-        const IrU32 bits = readF16Bits(sourceAt(inst, index));
+        const IrU32 bits = flushF16Input(readF16Bits(sourceAt(inst, index)));
         const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
         return IrU32(ir.Select(nan.Value(), quietNan16(bits).Value(), bits.Value()));
     };
@@ -237,10 +251,6 @@ void TranslationContext::vPackB32F16(const RdnaInstruction& inst) {
     const IrU32 high(ir.ShiftLeftLogical(half(1u).Value(), ir.Constant(16u)));
     const IrU32 result(ir.BitwiseOr(low.Value(), high.Value()));
     writeOperand(inst.destination, &result.Value());
-}
-
-void TranslateConvertInstruction(TranslationContext& context, const RdnaInstruction& instruction) {
-    throw std::runtime_error("TranslateConvertInstruction not implemented");
 }
 
 }

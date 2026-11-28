@@ -10,6 +10,7 @@
 #include "prx/libc/include/specifics/itanium/UnwindAbi.hpp"
 
 extern "C" const std::uintptr_t* UnwindCursorSlots_nid_no_patch();
+extern "C" bool LibcUnwindHasFrame_nid_no_patch(const std::uintptr_t* registers);
 
 struct _Unwind_Context {
     const std::uintptr_t* cursor = UnwindCursorSlots_nid_no_patch();
@@ -24,6 +25,12 @@ struct _Unwind_Context {
     std::uintptr_t dataBase {};
     std::uintptr_t personality {};
     bool signalFrame {};
+    std::uintptr_t regionEnd {};
+    std::uintptr_t frameEntry {};
+    std::uintptr_t frameEntrySize {};
+    std::uintptr_t argumentsSize {};
+    std::uintptr_t segment {};
+    bool infoMissing {};
 };
 
 namespace LibcUnwind {
@@ -99,7 +106,7 @@ inline unsigned EncodingSize(Byte encoding) {
     }
 }
 
-struct Lookup { Word pc; const Byte* fde {}; Word text {}; Word data {}; };
+struct Lookup { Word pc; const Byte* fde {}; Word text {}; Word data {}; Word segment {}; };
 
 struct Frame {
     const Byte* cieBegin {};
@@ -111,6 +118,12 @@ struct Frame {
     std::intptr_t dataAlign {};
     unsigned returnRegister {};
     bool signal {};
+#ifdef __APPLE__
+    bool useCompact {};
+    std::uint32_t compactEncoding {};
+    Word functionStart {};
+    Word functionEnd {};
+#endif
 #ifdef _WIN32
     bool foreign {};
     _Unwind_Context caller {};
@@ -172,7 +185,7 @@ constexpr unsigned RuleCount = 33;
 constexpr unsigned RuleCount = 17;
 #endif
 
-struct Rules { Rule registers[RuleCount] {}; unsigned cfaRegister {7}; std::intptr_t cfaOffset {}; const Byte* cfaExpression {}; };
+struct Rules { Rule registers[RuleCount] {}; unsigned cfaRegister {7}; std::intptr_t cfaOffset {}; const Byte* cfaExpression {}; Word argumentsSize {}; };
 
 inline bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Word target, Rules& state, const Rules& initial) {
     Word location = frame.start;
@@ -221,7 +234,7 @@ inline bool Instructions(const Byte* p, const Byte* end, const Frame& frame, Wor
             if (reg < RuleCount) state.registers[reg] = {unsigned(opcode == 16 ? 3 : 6), 0, expr};
             break;
         }
-        case 46: Uleb(p); break;
+        case 46: state.argumentsSize = Uleb(p); break;
         default: return false;
         }
     }

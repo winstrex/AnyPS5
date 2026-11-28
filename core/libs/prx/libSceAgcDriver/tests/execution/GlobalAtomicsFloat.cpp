@@ -684,6 +684,7 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const std
         {0, 0, 0, 128}
     };
     request.useCache = false;
+    request.context.floatMode = ShaderRecompiler::ShaderFloatMode{0xf0u, true, false, false};
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
@@ -736,10 +737,6 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (!TargetHasCapability(device->Target(), spv::CapabilityInt64Atomics)) {
-            std::puts("skipped, the device has no shaderBufferInt64Atomics");
-            return VulkanTestSkipped;
-        }
         GuestBlock writable(true);
         GuestBlock readOnly(false);
         RunAtomics(*device, writable, 32);

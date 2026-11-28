@@ -8,6 +8,7 @@ import tempfile
 DT_NEEDED = 1
 DT_PLTRELSZ = 2
 DT_PLTGOT = 3
+DT_HASH = 4
 DT_STRTAB = 5
 DT_SYMTAB = 6
 DT_RELA = 7
@@ -21,11 +22,22 @@ DT_OS_PLTGOT = 0x61000027
 DT_OS_JMPREL = 0x61000029
 DT_OS_PLTREL = 0x6100002B
 DT_OS_PLTRELSZ = 0x6100002D
+DT_OS_SYMTAB = 0x61000039
 DT_OS_SYMTABSZ = 0x6100003F
+DT_GNU_HASH = 0x6FFFFEF5
+
+
+TARGET_OPTIONS = {
+    "windows": ["--windows"],
+    "macos": ["--macos"],
+    "lazy": ["--lazy-binding"],
+    "fixed": ["--linux-fixed-base", "0x10000000"],
+}
 
 
 def fixture(jmprel=0x700, pltrelsz=24, os_tags=True, target=0x300, symtab=0x620,
-            symbol_bytes=48, symbol_index=1, relocation_type=None, data_relocations=False, linux=False):
+            symbol_bytes=48, symbol_index=1, relocation_type=None, data_relocations=False, linux=False,
+            addend=0, sce_size=0x1000):
     image = bytearray(0x1000)
     if relocation_type is None:
         relocation_type = 6 if data_relocations else 7
@@ -37,7 +49,7 @@ def fixture(jmprel=0x700, pltrelsz=24, os_tags=True, target=0x300, symtab=0x620,
         (DT_NEEDED, 1),
         (DT_STRTAB, 0x600),
         (DT_STRSZ, 16),
-        (DT_SYMTAB, symtab),
+        (DT_OS_SYMTAB if os_tags else DT_SYMTAB, symtab),
         (DT_SYMENT, 24),
         (DT_OS_SYMTABSZ, symbol_bytes),
         (DT_RELA, 0x700 if data_relocations else 0x7A0),
@@ -56,13 +68,13 @@ def fixture(jmprel=0x700, pltrelsz=24, os_tags=True, target=0x300, symtab=0x620,
     struct.pack_into("<IIQQQQQQ", image, 120,
                      2, 6, 0x400, 0x400, 0x400, len(tags) * 16, len(tags) * 16, 8)
     struct.pack_into("<IIQQQQQQ", image, 176,
-                     0x61000000, 0, 0, 0, 0, len(image), len(image), 1)
+                     0x61000000, 0, 0, 0, 0, sce_size, sce_size, 1)
     if linux:
         for index in range(3, 8):
             struct.pack_into("<I", image, 64 + index * 56, 0x6fffff01)
     for index, tag in enumerate(tags):
         struct.pack_into("<qQ", image, 0x400 + index * 16, *tag)
-    struct.pack_into("<QQq", image, 0x700, target, (symbol_index << 32) | relocation_type, 0)
+    struct.pack_into("<QQq", image, 0x700, target, (symbol_index << 32) | relocation_type, addend)
     symbol = symtab + symbol_index * 24
     if symbol <= len(image) - 4:
         struct.pack_into("<I", image, symbol, 8)
@@ -72,11 +84,39 @@ def fixture(jmprel=0x700, pltrelsz=24, os_tags=True, target=0x300, symtab=0x620,
     return image
 
 
-def run(relinker, work, name, image, expected_error=None, target="windows"):
+def with_hash(image, tag, table):
+    image = bytearray(image)
+    tags = []
+    for position in range(0x400, 0x500, 16):
+        entry = struct.unpack_from("<qQ", image, position)
+        if entry[0] == 0:
+            break
+        tags.append(entry)
+    tags += [(tag, 0x7C0), (0, 0)]
+    for index, entry in enumerate(tags):
+        struct.pack_into("<qQ", image, 0x400 + index * 16, *entry)
+    struct.pack_into("<QQ", image, 120 + 32, len(tags) * 16, len(tags) * 16)
+    image[0x7C0:0x7C0 + len(table)] = table
+    return image
+
+
+def with_sysv_hash(image, chains):
+    return with_hash(image, DT_HASH, struct.pack("<III", 1, chains, 1) + bytes(4 * chains))
+
+
+def with_gnu_hash(image, symbols):
+    chains = [0] * (symbols - 1)
+    chains[-1] = 1
+    return with_hash(image, DT_GNU_HASH, struct.pack("<IIIIQI", 1, 1, 1, 0, 0, 1) + struct.pack(f"<{len(chains)}I", *chains))
+
+
+def run(relinker, work, name, image, expected_error=None, target="windows", filter_level=None):
     source = work / (name + ".elf")
     output = work / (name + ".out")
     source.write_bytes(image)
-    options = ["--windows"] if target == "windows" else []
+    options = list(TARGET_OPTIONS.get(target, []))
+    if filter_level is not None:
+        options.append(f"unused-filter={filter_level}")
     result = subprocess.run([str(relinker), "--skip-sce-module", *options, str(source), str(output)],
                             capture_output=True, text=True, timeout=20)
     if expected_error is None:
@@ -93,7 +133,26 @@ def main():
         work = Path(directory)
         run(relinker, work, "os-valid", fixture())
         run(relinker, work, "sysv-valid", fixture(os_tags=False))
+        run(relinker, work, "os-table-inside-sce-dynlibdata", fixture(sce_size=0x718))
+        run(relinker, work, "os-table-outside-sce-dynlibdata", fixture(sce_size=0x700),
+            "Jump relocation table is outside PT_SCE_DYNLIBDATA")
         run(relinker, work, "empty-table", fixture(pltrelsz=0))
+        run(relinker, work, "symbol-entry-outside-sce-segment",
+            fixture(symtab=0xFE0, symbol_bytes=None), "Symbol table entry out of bounds")
+        run(relinker, work, "symbol-entry-past-sce-segment",
+            fixture(symtab=0x780, symbol_bytes=None, sce_size=0x798), "Symbol table entry out of bounds")
+        run(relinker, work, "symbol-entry-past-sce-segment-last-byte",
+            fixture(symtab=0x780, symbol_bytes=None, sce_size=0x7AF), "Symbol table entry out of bounds")
+        for hash_name, hashed in (("sysv", with_sysv_hash), ("gnu", with_gnu_hash)):
+            for output_target in ("linux", "windows"):
+                for data in (False, True):
+                    options = {"os_tags": False, "symbol_bytes": None, "linux": output_target == "linux", "data_relocations": data}
+                    prefix = f"{hash_name}-hash-{output_target}-{'data' if data else 'plt'}"
+                    run(relinker, work, prefix + "-valid", hashed(fixture(**options), 2), target=output_target)
+                    run(relinker, work, prefix + "-past-chain", hashed(fixture(symbol_index=2, **options), 2),
+                        "Symbol table entry out of bounds", target=output_target)
+        run(relinker, work, "symbol-entry-at-sce-segment-end",
+            fixture(symtab=0x780, symbol_bytes=0x30, sce_size=0x7B0))
         run(relinker, work, "offset-max-empty-table",
             fixture(jmprel=0xFFFFFFFFFFFFFFFF, pltrelsz=0), error)
         run(relinker, work, "offset-wrap-empty-table",
@@ -124,6 +183,28 @@ def main():
                         "Symbol table entry out of bounds", target=output_target)
                     run(relinker, work, prefix + "-none", fixture(symbol_bytes=0, symbol_index=0xFFFFFFFF,
                                                                  relocation_type=0, **options), target=output_target)
+                else:
+                    run(relinker, work, prefix + "-unsupported-plt-type", fixture(relocation_type=6, **options),
+                        "Unsupported PLT relocation type", target=output_target)
+                    run(relinker, work, prefix + "-relative-in-plt", fixture(relocation_type=8, **options),
+                        "Unsupported PLT relocation type", target=output_target)
+                    run(relinker, work, prefix + "-none-in-plt", fixture(relocation_type=0, symbol_index=0, **options),
+                        "Unsupported PLT relocation type", target=output_target)
+                    for level in (1, 2):
+                        run(relinker, work, f"{prefix}-none-in-plt-filter-{level}",
+                            fixture(relocation_type=0, symbol_index=0, **options),
+                            "Unsupported PLT relocation type", target=output_target, filter_level=level)
+        for output_target in ("linux", "fixed", "lazy", "windows", "macos"):
+            for data in (False, True):
+                prefix = f"{output_target}-{'glob-dat' if data else 'jump-slot'}-addend"
+                run(relinker, work, prefix + "-zero", fixture(linux=True, data_relocations=data), target=output_target)
+                for addend in (0x10, -8):
+                    if data:
+                        run(relinker, work, f"{prefix}-{addend:x}", fixture(linux=True, data_relocations=data, addend=addend),
+                            target=output_target)
+                    else:
+                        run(relinker, work, f"{prefix}-{addend:x}", fixture(linux=True, data_relocations=data, addend=addend),
+                            "JUMP_SLOT relocation has a nonzero addend", target=output_target)
     print("Jump relocation table bounds tests passed")
 
 

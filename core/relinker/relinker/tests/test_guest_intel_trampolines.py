@@ -12,10 +12,11 @@ SITE_ADDRESSES = (0x1002, 0x1012)
 PLAIN_SITE = b"\x90" * len(SITE)
 RIP_DISPLACEMENT = 0x10F6
 RIP_SITE = bytes.fromhex("0f 38 cc 15") + struct.pack("<i", RIP_DISPLACEMENT)
-CASES = (("plain", PLAIN_SITE), ("stub", SITE), ("rip", RIP_SITE))
+EXTRQ_SITE = bytes.fromhex("66 0f 78 c0 07 03")
+CASES = (("plain", PLAIN_SITE), ("stub", SITE), ("rip", RIP_SITE), ("symbolic", SITE), ("extrq", EXTRQ_SITE))
 
 
-def guest_fixture(site):
+def guest_fixture(site, symbolic=False):
     image = bytearray(0xA00)
     image[:16] = b"\x7fELF\x02\x01\x01" + bytes(9)
     struct.pack_into("<HHIQQQIHHHHHH", image, 16,
@@ -25,7 +26,10 @@ def guest_fixture(site):
     struct.pack_into("<IIQQQQQQ", image, 120,
                      1, 6, 0x600, 0x2000, 0x2000, 0x400, 0x400, 0x100)
     tags = [(5, 0x2200), (10, 1), (6, 0x2220), (11, 24),
-            (4, 0x2240), (7, 0x2300), (8, 0), (9, 24), (0, 0)]
+            (4, 0x2240), (7, 0x2300), (8, 0), (9, 24)]
+    if symbolic:
+        tags.append((30, 2))
+    tags.append((0, 0))
     struct.pack_into("<IIQQQQQQ", image, 176,
                      2, 6, 0x600, 0x2000, 0x2000, len(tags) * 16, len(tags) * 16, 8)
     image[0x400:0x500] = b"\x90" * 0x100
@@ -110,6 +114,17 @@ def check_rip_trampoline(read, site_address):
     assert operand == site_address + len(RIP_SITE) + RIP_DISPLACEMENT, (site_address, operand)
 
 
+def check_extrq_trampoline(read, site_address):
+    patched = read(site_address, len(EXTRQ_SITE))
+    assert patched[0] == 0xE9 and patched[5] == 0x90, patched.hex()
+    target = site_address + 5 + struct.unpack_from("<i", patched, 1)[0]
+    body = read(target, 24)
+    assert body[:19] == bytes.fromhex("66 0f 73 d0 03 66 0f 73 f0 39 66 0f 73 d0 39 f3 0f 7e c0"), body.hex()
+    assert body[19] == 0xE9, body.hex()
+    continuation = target + 24 + struct.unpack_from("<i", body, 20)[0]
+    assert continuation == site_address + len(EXTRQ_SITE), (target, continuation)
+
+
 def main():
     relinker = Path(sys.argv[1]).resolve()
     with tempfile.TemporaryDirectory(prefix="anyps5-guest-intel-") as directory:
@@ -123,7 +138,7 @@ def main():
                 source = case / "input.elf"
                 output = case / ("output.exe" if windows else "output.elf")
                 source.write_bytes(main_fixture())
-                (module_dir / "sample.prx").write_bytes(guest_fixture(site))
+                (module_dir / "sample.prx").write_bytes(guest_fixture(site, symbolic=kind == "symbolic"))
                 arguments = [str(relinker), "--to-intel"]
                 if windows:
                     arguments.append("--windows")
@@ -147,6 +162,9 @@ def main():
                 if kind == "rip":
                     for site_address in site_addresses:
                         check_rip_trampoline(read, site_address)
+                elif kind == "extrq":
+                    for site_address in site_addresses:
+                        check_extrq_trampoline(read, site_address)
                 elif has_stub:
                     for site_address in site_addresses:
                         check_trampoline(read, site_address)

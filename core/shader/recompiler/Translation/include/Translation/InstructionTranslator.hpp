@@ -7,6 +7,8 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Translation/EmbeddedVertexFetch.hpp"
+#include "SplitStateAbi.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -30,21 +32,33 @@ struct TranslateOptions {
     std::uint32_t userDataBaseRegister = 0;
     std::uint32_t userDataCount = 64;
     std::uint32_t scratchDwords = 0;
+    std::uint32_t sharedVectorBase = 0;
+    std::uint32_t sharedVectorCount = 0;
     std::uint32_t sharedMemoryBytes = 0;
     std::uint64_t shaderHash = 0;
     bool fragmentShaderBarycentricEnabled = false;
+    bool interpolationFunctions = false;
     bool nativeFloat16 = false;
+    bool float32FlushToZero = false;
+    bool float32FlushDeclared = false;
+    bool float32DenormPreserve = false;
+    bool float64 = false;
+    bool gcnLegacyVertexInputs = false;
+    bool nativeFloat16Fma = false;
+    bool float16HostNans = false;
+    bool nativeInteger16 = false;
     std::optional<ShaderFloatMode> floatMode;
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
+    const SplitStateAbi::Plan* splitState = nullptr;
 };
+
+[[nodiscard]] bool NanSpeculationRestorable(const IrBlock& block, std::size_t firstInstruction);
+[[nodiscard]] bool NanSpeculationLaneLocal(const IrBlock& block, std::size_t firstInstruction);
 
 class InstructionTranslator {
 public:
     [[nodiscard]] IrProgram Translate(const RdnaProgram& decoded, const ControlFlowGraph& cfg, const TranslateOptions& options) const;
-
-private:
-    void translateInstruction(IrBuilder& builder, const RdnaInstruction& instruction, const ControlFlowGraph& cfg, const TranslateOptions& options) const;
 };
 
 }

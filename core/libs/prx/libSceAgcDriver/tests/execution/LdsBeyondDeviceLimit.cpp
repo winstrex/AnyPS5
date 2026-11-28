@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "ExecutionHelpers.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -56,17 +57,6 @@ constexpr const char* Names[Checked] = {
     "other wave's word below the limit", "out-of-range read", "final 32-bit counter", "final 64-bit counter low",
     "final 64-bit counter high", "ds_read_b64 above the limit, low", "ds_read_b64 above the limit, high", "own word below the limit",
 };
-
-std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
-    const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
-}
-
-std::string Hex(std::uint32_t value) {
-    char text[16];
-    std::snprintf(text, sizeof(text), "0x%08x", value);
-    return text;
-}
 
 std::uint64_t WorkgroupBytes(std::span<const std::uint32_t> words) {
     std::unordered_map<std::uint32_t, std::span<const std::uint32_t>> types;
@@ -148,7 +138,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRe
     Require(within.workgroupMemoryDwords == 0u, "lds beyond the device limit " + run + ": LDS below the device limit left workgroup memory");
     fits(within, "LDS below the device limit");
     const auto atLimit = Compile(waveSize, limit, target);
-    Require(atLimit.workgroupMemoryDwords == limit / 4u + 1u, "lds beyond the device limit " + run + ": LDS at the device limit gave " + std::to_string(atLimit.workgroupMemoryDwords) + " device memory dwords per workgroup");
+    Require(atLimit.workgroupMemoryDwords == limit / 4u + 2u, "lds beyond the device limit " + run + ": LDS at the device limit gave " + std::to_string(atLimit.workgroupMemoryDwords) + " device memory dwords per workgroup");
     fits(atLimit, "LDS at the device limit");
     const auto bytes = limit + AboveLimitBytes;
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
@@ -159,7 +149,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t waveSize, const ShaderRe
     }
     Output.fill(Untouched);
     const auto result = Compile(waveSize, bytes, target);
-    Require(result.workgroupMemoryDwords == bytes / 4u + 1u, "lds beyond the device limit " + run + ": " + std::to_string(bytes) + " bytes of LDS gave " + std::to_string(result.workgroupMemoryDwords) + " device memory dwords per workgroup");
+    Require(result.workgroupMemoryDwords == bytes / 4u + 2u, "lds beyond the device limit " + run + ": " + std::to_string(bytes) + " bytes of LDS gave " + std::to_string(result.workgroupMemoryDwords) + " device memory dwords per workgroup");
     fits(result, "LDS above the device limit");
     if (indirect) {
         IndirectGroups = {groupsX, groupsY, groupsZ, 0u};

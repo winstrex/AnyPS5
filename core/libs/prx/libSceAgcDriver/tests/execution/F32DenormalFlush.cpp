@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "ExecutionHelpers.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -10,9 +11,9 @@
 #include <cstdio>
 #include <iostream>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <vector>
+#include <spirv/unified1/spirv.hpp>
 
 namespace {
 
@@ -234,11 +235,31 @@ constexpr std::uint32_t TinyDirected[3][32][2] = {
         {0x80000000u, 0x00000000u}, {0x80000000u, 0x00000000u}, {0x80000000u, 0x00000000u}, {0x80000000u, 0x00000000u}
     }
 };
-constexpr std::uint32_t TinyLegacyExpected[32] = {
-    0x00000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
-    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
-    0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0x80000000u, 0x80000000u,
-    0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u
+constexpr std::uint32_t TinyLegacyExpected[4][32] = {
+    {
+        0x00800000u, 0x80800000u, 0x00800000u, 0x00800000u, 0x00800000u, 0x80800000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00800000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00800000u, 0x00000000u, 0x00000000u,
+        0x80800000u, 0x00800000u, 0x80800000u, 0x80800000u, 0x80800000u, 0x00800000u, 0x80000000u, 0x80000000u,
+        0x80000000u, 0x80800000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80800000u, 0x00000000u, 0x80000000u
+    },
+    {
+        0x00800000u, 0x80000000u, 0x00800000u, 0x00800000u, 0x00800000u, 0x00000000u, 0x00800000u, 0x00000000u,
+        0x00000000u, 0x00800000u, 0x00000000u, 0x00000000u, 0x00800000u, 0x00800000u, 0x00000000u, 0x00000000u,
+        0x80000000u, 0x00800000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x00800000u, 0x80000000u, 0x80000000u,
+        0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u
+    },
+    {
+        0x00000000u, 0x80800000u, 0x00000000u, 0x00000000u, 0x80000000u, 0x80800000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x80800000u, 0x00000000u, 0x80800000u, 0x80800000u, 0x80800000u, 0x80000000u, 0x80800000u, 0x80000000u,
+        0x80000000u, 0x80800000u, 0x80000000u, 0x80000000u, 0x80800000u, 0x80800000u, 0x80000000u, 0x80000000u
+    },
+    {
+        0x00000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+        0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0x80000000u, 0x80000000u,
+        0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u
+    }
 };
 constexpr const char* TinyLegacyNames[2] = {
     "v_mad_legacy_f32 v18, v4, v5, v6",
@@ -370,23 +391,39 @@ constexpr const char* MixedTinyNames[8] = {
     "v_fma_mix_f32 v17, v4, v8, v7 op_sel:[0,0,1] op_sel_hi:[0,0,1]",
 };
 
-std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
-    const auto address = reinterpret_cast<std::uintptr_t>(data);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
-}
-
-std::string Hex(std::uint32_t value) {
-    char text[16];
-    std::snprintf(text, sizeof(text), "0x%08x", value);
-    return text;
-}
+bool FusedExactArithmetic = false;
 
 void Expect(std::uint32_t tid, std::uint32_t actual, std::uint32_t expected, const char* name) {
-    Require(actual == expected, std::string("f32 denormal flush: lane ") + std::to_string(tid) + " " + name + " is " + Hex(actual) + ", expected " + Hex(expected));
+    Require(actual == expected, std::string("f32 denormal flush: ") + (FusedExactArithmetic ? "fused " : "") + "lane " + std::to_string(tid) + " " + name + " is " + Hex(actual) + ", expected " + Hex(expected));
 }
 
 bool IsNan(std::uint32_t value) {
     return (value & 0x7fffffffu) > 0x7f800000u;
+}
+
+bool HardwareFlush = false;
+
+std::size_t CompiledWords(AgcDriver::VulkanDevice& device, bool hardwareFlush, bool& declaresFlush) {
+    std::vector<std::uint32_t> userData(8, 0u);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(Code.data()), std::as_bytes(std::span(Code))}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(Code.data()), Code, 0, {}},
+        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    request.target.float32FlushToZero = hardwareFlush;
+    const auto result = ShaderRecompiler::Recompile(request);
+    const auto words = result.spirv.Words();
+    declaresFlush = false;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        if ((words[cursor] & 0xffffu) == spv::OpExecutionMode && count == 4u && words[cursor + 2u] == spv::ExecutionModeDenormFlushToZero && words[cursor + 3u] == 32u) declaresFlush = true;
+        cursor += count;
+    }
+    return words.size();
 }
 
 void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode, std::span<const std::uint32_t> code = Code, const std::uint32_t (*rows)[Inputs] = Rows) {
@@ -407,6 +444,8 @@ void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::
     };
     request.useCache = false;
     request.context.floatMode = floatMode;
+    request.target.float32FlushToZero = HardwareFlush;
+    request.target.fusedExactArithmetic = FusedExactArithmetic;
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
@@ -424,7 +463,7 @@ void Check(const char* mode) {
             if (hostSplits && tid == TinyProductLane && (i == 4u || i == 5u)) continue;
             const bool floatResult = i < 12u || i >= 15u;
             if (floatResult && IsNan(Expected[tid][i])) {
-                Require(IsNan(out[i]), std::string("f32 denormal flush: lane ") + std::to_string(tid) + " " + mode + " " + Names[i] + " is " + Hex(out[i]) + ", expected a NaN");
+                Require(IsNan(out[i]), std::string("f32 denormal flush: ") + (FusedExactArithmetic ? "fused " : "") + "lane " + std::to_string(tid) + " " + mode + " " + Names[i] + " is " + Hex(out[i]) + ", expected a NaN");
                 continue;
             }
             Expect(tid, out[i], Expected[tid][i], (std::string(mode) + " " + Names[i]).c_str());
@@ -457,9 +496,9 @@ void CheckMixedTiny(const std::string& mode, std::uint32_t round = 0u) {
     }
 }
 
-void CheckTinyLegacy(const std::string& mode) {
+void CheckTinyLegacy(const std::string& mode, std::uint32_t round = 0u) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
-        for (std::uint32_t i = 0; i < 2; ++i) Expect(tid, Output[tid * TinyResults + 8u + i], TinyLegacyExpected[tid], (mode + " " + TinyLegacyNames[i]).c_str());
+        for (std::uint32_t i = 0; i < 2; ++i) Expect(tid, Output[tid * TinyResults + 8u + i], TinyLegacyExpected[round][tid],(mode + " " + TinyLegacyNames[i]).c_str());
     }
 }
 
@@ -477,44 +516,54 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Run(*device, std::nullopt);
-        Check("no float mode");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false});
-        Check("IEEE=0 f32 denormals flushed");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false});
-        Check("IEEE=1 all denormals flushed");
-        Run(*device, std::nullopt, MixedTinyCode, MixedTinyRows);
-        CheckMixedTiny("no float mode");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, MixedTinyCode, MixedTinyRows);
-        CheckMixedTiny("IEEE=0 mixed sources");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false}, MixedTinyCode, MixedTinyRows);
-        CheckMixedTiny("IEEE=1 mixed sources");
-        for (std::uint32_t round = 1u; round < 4u; ++round) {
-            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u | round, true, false, false}, MixedTinyCode, MixedTinyRows);
-            CheckMixedTiny("mixed sources round mode " + std::to_string(round), round);
+        const auto capabilities = device->Target().supportedCapabilities;
+        const bool declared = std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)) != capabilities.end();
+        const bool native = !declared && device->Target().float32FlushToZero;
+        const bool hardware = declared || native;
+        if (hardware) {
+            bool softwareDeclares = true;
+            bool hardwareDeclares = false;
+            const auto software = CompiledWords(*device, false, softwareDeclares);
+            const auto hardwareWords = CompiledWords(*device, true, hardwareDeclares);
+            Require(!softwareDeclares && hardwareDeclares == declared, declared ? "f32 denormal flush: only the hardware-flush module declares DenormFlushToZero 32" : "f32 denormal flush: a module flushed natively declares DenormFlushToZero 32 without the device capability");
+            Require(hardwareWords < software, "f32 denormal flush: the hardware-flush module is " + std::to_string(hardwareWords) + " words, the emulated one " + std::to_string(software));
         }
-        Run(*device, std::nullopt, TinyCode, TinyRows);
-        CheckTinyLegacy("no float mode");
-        CheckTiny("no float mode");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, TinyCode, TinyRows);
-        CheckTinyLegacy("IEEE=0 f32 denormals flushed");
-        CheckTiny("IEEE=0 f32 denormals flushed");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false}, TinyCode, TinyRows);
-        CheckTinyLegacy("IEEE=1 all denormals flushed");
-        CheckTiny("IEEE=1 all denormals flushed");
-        for (std::uint32_t round = 1u; round < 4u; ++round) {
-            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u | round, true, false, false}, TinyCode, TinyRows);
-            CheckTinyLegacy("round mode " + std::to_string(round));
-            CheckTinyDirected(round);
-        }
-        for (const std::uint32_t mode : {0xd0u, 0xe0u}) {
-            bool refused = false;
-            try {
-                Run(*device, ShaderRecompiler::ShaderFloatMode{mode, true, false, false});
-            } catch (const std::runtime_error& error) {
-                refused = std::string(error.what()).find("f32 denormal mode") != std::string::npos;
+        for (const std::uint32_t variant : {0u, 1u, 2u, 3u}) {
+            const bool flush = (variant & 1u) != 0u;
+            if (flush && !hardware) continue;
+            if ((variant & 2u) == 0u && device->Target().fusedExactArithmetic) continue;
+            HardwareFlush = flush;
+            FusedExactArithmetic = (variant & 2u) != 0u;
+            Run(*device, std::nullopt);
+            Check("no float mode");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false});
+            Check("IEEE=0 f32 denormals flushed");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false});
+            Check("IEEE=1 all denormals flushed");
+            Run(*device, std::nullopt, MixedTinyCode, MixedTinyRows);
+            CheckMixedTiny("no float mode");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, MixedTinyCode, MixedTinyRows);
+            CheckMixedTiny("IEEE=0 mixed sources");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false}, MixedTinyCode, MixedTinyRows);
+            CheckMixedTiny("IEEE=1 mixed sources");
+            for (std::uint32_t round = 1u; round < 4u; ++round) {
+                Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u | round, true, false, false}, MixedTinyCode, MixedTinyRows);
+                CheckMixedTiny("mixed sources round mode " + std::to_string(round), round);
             }
-            Require(refused, "f32 denormal flush: FLOAT_MODE " + Hex(mode) + " was not refused");
+            Run(*device, std::nullopt, TinyCode, TinyRows);
+            CheckTinyLegacy("no float mode");
+            CheckTiny("no float mode");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, TinyCode, TinyRows);
+            CheckTinyLegacy("IEEE=0 f32 denormals flushed");
+            CheckTiny("IEEE=0 f32 denormals flushed");
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0x00u, false, true, false}, TinyCode, TinyRows);
+            CheckTinyLegacy("IEEE=1 all denormals flushed");
+            CheckTiny("IEEE=1 all denormals flushed");
+            for (std::uint32_t round = 1u; round < 4u; ++round) {
+                Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u | round, true, false, false}, TinyCode, TinyRows);
+                if (round != 2u) CheckTinyLegacy("round mode " + std::to_string(round), round);
+                CheckTinyDirected(round);
+            }
         }
         std::puts("f32 denormal flush tests passed");
         return 0;

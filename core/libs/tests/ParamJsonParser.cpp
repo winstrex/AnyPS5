@@ -70,7 +70,12 @@ static void CheckUserDefinedParams(const std::filesystem::path& path) {
                                         R"("userDefinedParam1":23566,"userDefinedParam3":-7,"userDefinedParam4":2147483647})");
     Require(parsed.userDefinedParams[0] == 23566 && parsed.userDefinedParams[1] == 0 && parsed.userDefinedParams[2] == -7 &&
             parsed.userDefinedParams[3] == 2147483647, "Incorrect user defined params");
-    for (const auto* text : {"2147483648", "1.5", "1e3", "\"1\"", "true"}) {
+    const auto unsignedParams = ParseText(path, R"({"titleId":"PPSA00000","localizedParameters":{"en-US":{"titleName":"Example"}},)"
+                                                R"("userDefinedParam1":2147483648,"userDefinedParam2":3368540011,"userDefinedParam3":4294967295,"userDefinedParam4":-2147483648})");
+    Require(unsignedParams.userDefinedParams[0] == std::numeric_limits<std::int32_t>::min() && unsignedParams.userDefinedParams[1] == -926427285 &&
+            unsignedParams.userDefinedParams[2] == -1 && unsignedParams.userDefinedParams[3] == std::numeric_limits<std::int32_t>::min(),
+            "Unsigned 32-bit user defined params were not kept as their 32-bit value");
+    for (const auto* text : {"4294967296", "-2147483649", "1.5", "1e3", "\"1\"", "true"}) {
         bool rejected = false;
         try {
             ParseText(path, std::string(R"({"titleId":"PPSA00000","localizedParameters":{"en-US":{"titleName":"Example"}},"userDefinedParam2":)") + text + "}");
@@ -79,6 +84,12 @@ static void CheckUserDefinedParams(const std::filesystem::path& path) {
         }
         Require(rejected, std::string("Accepted invalid user defined param: ") + text);
     }
+}
+
+static void CheckContentVersion(const std::filesystem::path& path) {
+    Require(ParseText(path, R"({"titleId":"PPSA00000","contentVersion":"01.002.000","localizedParameters":{"en-US":{"titleName":"Example"}}})").contentVersion == "01.002.000", "Incorrect content version");
+    Require(ParseText(path, R"({"titleId":"PPSA00000","localizedParameters":{"en-US":{"titleName":"Example"}}})").contentVersion.empty(), "A missing content version was not empty");
+    Require(ParseText(path, R"({"titleId":"PPSA00000","contentVersion":1,"localizedParameters":{"en-US":{"titleName":"Example"}}})").contentVersion.empty(), "A content version that is not a string was kept");
 }
 
 static void CheckNesting(const std::filesystem::path& path) {
@@ -102,11 +113,12 @@ static void CheckFlexibleMemorySize(const std::filesystem::path& path) {
     const std::string prefix = R"({"titleId":"PPSA00000","localizedParameters":{"en-US":{"titleName":"Example"}})";
     Require(!ParseText(path, prefix + "}").flexibleMemorySizeBytes, "Absent kernel changed the default budget");
     Require(!ParseText(path, prefix + R"(,"kernel":{}})").flexibleMemorySizeBytes, "Absent flexible size changed the default budget");
+    Require(!ParseText(path, prefix + R"(,"kernel":{"flexibleMemorySize":0}})").flexibleMemorySizeBytes, "A zero flexible size changed the default budget");
     for (const auto bytes : {std::uint64_t{16384}, std::uint64_t{838860800}, std::uint64_t{18446744073709535232ull}}) {
         const auto parsed = ParseText(path, prefix + R"(,"kernel":{"flexibleMemorySize":)" + std::to_string(bytes) + "}}");
         Require(parsed.flexibleMemorySizeBytes == bytes, "Incorrect flexible memory size in bytes");
     }
-    for (const auto* value : {"0", "-0", "-16384", "1", "16385", "838860800.0", "8e8", "true", "null", "\"838860800\"", "18446744073709551616"}) {
+    for (const auto* value : {"-0", "-16384", "1", "16385", "838860800.0", "8e8", "true", "null", "\"838860800\"", "18446744073709551616"}) {
         bool rejected = false;
         try { ParseText(path, prefix + R"(,"kernel":{"flexibleMemorySize":)" + value + "}}"); }
         catch (const std::runtime_error&) { rejected = true; }
@@ -145,6 +157,7 @@ static void CheckLanguages(const std::filesystem::path& path) {
 static void CheckOutputPermission(const std::filesystem::path& path) {
     const std::string prefix = R"({"titleId":"PPSA99007","localizedParameters":{"en-US":{"titleName":"Example"}})";
     Require(ParseText(path, prefix + "}").attribute3 == 0, "Absent output permission is not zero");
+    Require(!ParseText(path, prefix + ",\"attribute\":8388608}").paramSfoAttribute, "param.json gave a param.sfo attribute");
     for (const auto& [text, expected] : {std::pair{"0", 0u}, {"524352", 0x80040u}, {"4294967295", 0xFFFFFFFFu}}) {
         Require(ParseText(path, prefix + ",\"attribute3\":" + text + "}").attribute3 == expected, "Incorrect output permission");
     }
@@ -225,6 +238,7 @@ int main() {
         }
         CheckLanguages(path);
         CheckUserDefinedParams(path);
+        CheckContentVersion(path);
         CheckOutputPermission(path);
         CheckNesting(path);
     } catch (const std::exception& error) {

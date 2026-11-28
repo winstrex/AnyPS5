@@ -10,9 +10,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -33,7 +36,10 @@ struct PthreadMutexattrPrivate {
     int protocol = 0;
     int ceiling = 0;
     int pshared = 0;
+    int generation = 0;
 };
+
+constexpr int ADAPTIVE_MUTEX_SPINS = 2000;
 
 struct PthreadMutexPrivate {
     std::recursive_timed_mutex _rmtx;
@@ -41,13 +47,26 @@ struct PthreadMutexPrivate {
     MutexType _type;
     std::atomic<std::thread::id> _owner;
     int _count;
+    std::atomic<int> _spinloops = 0;
+    std::atomic<int> _yieldloops = 0;
+    int _protocol = 0;
+    std::atomic<int> _ceiling{0};
+    std::string _name;
+    bool _named = false;
 
     PthreadMutexPrivate() : _type(MutexType::ErrorCheck), _owner(std::thread::id{}), _count(0) {}
+
+    void SetType(MutexType type) {
+        _type = type;
+        _spinloops = type == MutexType::Adaptive ? ADAPTIVE_MUTEX_SPINS : 0;
+    }
 };
 
 struct PthreadRwlockattrPrivate {
     int type;
 };
+
+inline PthreadRwlockattr const DESTROYED_RWLOCKATTR = reinterpret_cast<PthreadRwlockattr>(std::uintptr_t{1});
 
 struct PthreadRwlockPrivate {
     std::mutex _state;
@@ -55,21 +74,28 @@ struct PthreadRwlockPrivate {
     std::atomic<std::thread::id> _writer;
     std::atomic<int> _readers{0};
     int _waitingWriters = 0;
+    std::string _name;
+    bool _named = false;
 };
 
 struct PthreadCondattrPrivate {
     int _clockid;
+    int _pshared = 0;
 };
 
 struct PthreadCondPrivate {
-    TimedWait::Condition _cv;
+    std::shared_ptr<TimedWait::Condition> _cv = std::make_shared<TimedWait::Condition>();
     int _clockid = 0;
+    std::string _name;
+    bool _named = false;
 };
 
 struct PthreadSemPrivate {
     std::mutex _mutex;
     TimedWait::Condition _cv;
     int _count = 0;
+    int _waiters = 0;
+    bool _destroyed = false;
 
     explicit PthreadSemPrivate(unsigned int value) : _count(static_cast<int>(value)) {}
 };
@@ -98,9 +124,10 @@ struct PthreadAttrPrivate {
     int _schedpriority;
     int _schedpolicy;
     int _inheritsched;
-    KernelCpumask _affinity = DEFAULT_THREAD_AFFINITY;
+    bool _createSuspended = false;
+    KernelCpumask _affinity = ~KernelCpumask{0};
     bool _affinityExplicit = false;
-    std::size_t _guardsize = 0x1000;
+    std::size_t _guardsize = 0x4000;
     int _solosched = 0;
     int _scope = GUEST_SCOPE_SYSTEM;
 };
@@ -111,6 +138,7 @@ struct PthreadPrivate {
     std::int64_t tid = nextThreadId.fetch_add(1, std::memory_order_relaxed);
 #ifdef _WIN32
     void* nativeHandle = nullptr;
+    bool hostAdopted = false;
 #else
     pthread_t hostThread{};
 #endif
@@ -118,17 +146,26 @@ struct PthreadPrivate {
     std::atomic<unsigned> references{2};
     std::atomic<bool> inWait{false};
     std::atomic<int> pendingException{0};
+    std::atomic<bool> suspended{false};
+    bool createdSuspended = false;
     std::atomic<int> schedPolicy{1};
+    int inheritSched = 4;
     void* wakeEvent = nullptr;
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;
     std::atomic<int> waitCount{0};
     std::atomic<KernelCpumask> affinity{DEFAULT_THREAD_AFFINITY};
+    std::atomic<bool> explicitAffinity{false};
     std::atomic<int> priority{DEFAULT_THREAD_PRIORITY};
     int scope = GUEST_SCOPE_SYSTEM;
     int cpuClockThread = 0;
+    std::atomic<bool> initialThread{false};
 #ifndef _WIN32
+#ifdef __APPLE__
+    unsigned hostMachThread = 0;
+#else
     clockid_t hostCpuClock{};
+#endif
     bool hostCpuClockBound = false;
     void* guestStack = nullptr;
     std::size_t guestStackBytes = 0;
@@ -138,13 +175,18 @@ struct PthreadPrivate {
     std::string name;
     std::atomic<bool> _finished;
     void* _retval;
-    bool _detached;
+    std::atomic<bool> _detached;
     bool _adopted;
+    Pthread* _handleStorage;
+    std::atomic<bool> _joined;
+        bool _joining = false;
     std::mutex _join_mtx;
     TimedWait::Condition _join_cv;
     std::atomic<bool> cancelPending{false};
     std::mutex cancelLock;
     TimedWait::Condition* cancelWait = nullptr;
+    bool cancelWaitExiting = false;
+    std::uint32_t hostMxcsr = 0x1f80;
 
     explicit PthreadPrivate(const PthreadAttrPrivate* attr = nullptr);
     ~PthreadPrivate();
@@ -155,11 +197,40 @@ struct PthreadPrivate {
 bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end);
 bool GuestThreadStackHostRangeOverlaps(std::uintptr_t start, std::uintptr_t end);
 void NoteGuestStackProtection(std::uintptr_t start, std::size_t bytes, bool readWrite);
+#ifdef _WIN32
+bool ReplaceGuestThreadStack(std::uintptr_t start, std::size_t bytes, bool readWrite, const std::function<bool()>& replace);
+#endif
 int GuestThreadCpuClockId(const PthreadPrivate* thread);
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos);
-void SetLiveGuestThreadsAffinity(KernelCpumask mask);
+bool SetLiveGuestThreadsAffinity(KernelCpumask mask);
 KernelCpumask LiveGuestThreadsAffinity();
+KernelCpumask GuestProcessCpusetAffinity();
+bool SetLiveGuestProcessCpuset(KernelCpumask mask);
+enum class GuestCpusetTarget { Missing, Root, Process, Other };
+GuestCpusetTarget FindGuestCpuset(std::int64_t id);
 bool GuestThreadIsLive(const PthreadPrivate* thread);
+std::unique_lock<std::mutex> LockMainGuestThread_nid_no_patch(PthreadPrivate*& thread);
+std::unique_lock<std::mutex> LockLiveGuestThread(const PthreadPrivate* thread);
+std::unique_lock<std::mutex> LockRegisteredGuestThread(const PthreadPrivate* thread);
+extern "C" int ResumeGuestThread_nid_no_patch(PthreadPrivate* thread);
+#ifdef _WIN32
+extern "C" void DeliverPendingException_nid_no_patch(PthreadPrivate* thread);
+#endif
+extern "C" void ResumeAllGuestThreads_nid_no_patch();
 bool LiveGuestThreadExists(std::int64_t tid);
+extern "C" bool LiveGuestThreadName_nid_no_patch(std::int64_t tid, char* name, std::size_t capacity);
+struct LiveGuestThreadName {
+    std::int64_t tid;
+    std::string name;
+};
+std::vector<LiveGuestThreadName> LiveGuestThreadNames();
+bool GetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask& mask);
+bool GetLiveGuestThreadSched_nid_no_patch(std::int64_t tid, int& policy, int& priority);
+int SetLiveGuestThreadAffinity_nid_no_patch(std::int64_t tid, KernelCpumask mask);
+extern "C" std::size_t GetDefaultStackSize_nid_no_patch();
+extern "C" bool SetDefaultStackSize_nid_no_patch(std::size_t size);
+#if defined(__linux__)
+extern "C" [[noreturn]] void APS5_VABI EnterGuestMainStack_nid_no_patch(void* arguments, void (APS5_VABI* entry)(void*));
+#endif
 
 #endif

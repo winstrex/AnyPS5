@@ -1,17 +1,65 @@
 #include "Translation/InstructionTranslator.hpp"
 #include "Recompiler.hpp"
-#include "Translation/DispatchInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 
 namespace {
+
+bool UsesTessellationLanes(ShaderStageKind stage) {
+    return stage == ShaderStageKind::Local || stage == ShaderStageKind::TessellationControl || stage == ShaderStageKind::TessellationEvaluation;
+}
+
+std::optional<IrOpcode> SpeculationReader(IrOpcode write) {
+    switch (write) {
+        case IrOpcode::SetRegister: return IrOpcode::GetRegister;
+        case IrOpcode::SetThreadBitScalarRegister: return IrOpcode::GetThreadBitScalarRegister;
+        case IrOpcode::SetScalarMaskTag: return IrOpcode::GetScalarMaskTag;
+        case IrOpcode::SetScalarRegister: return IrOpcode::GetScalarRegister;
+        case IrOpcode::SetVectorRegister: return IrOpcode::GetVectorRegister;
+        case IrOpcode::SetScc: return IrOpcode::GetScc;
+        case IrOpcode::SetExec: return IrOpcode::GetExec;
+        case IrOpcode::SetExecLo: return IrOpcode::GetExecLo;
+        case IrOpcode::SetExecHi: return IrOpcode::GetExecHi;
+        case IrOpcode::SetVcc: return IrOpcode::GetVcc;
+        case IrOpcode::SetVccLo: return IrOpcode::GetVccLo;
+        case IrOpcode::SetVccHi: return IrOpcode::GetVccHi;
+        case IrOpcode::SetM0: return IrOpcode::GetM0;
+        default: return std::nullopt;
+    }
+}
+
+bool WritesSpeculationState(IrOpcode opcode) {
+    switch (opcode) {
+        case IrOpcode::SetGotoVariable:
+        case IrOpcode::SetTessellationAttribute:
+        case IrOpcode::SetAttribute:
+            return true;
+        default:
+            return IrOpcodeName(opcode).starts_with("Store") || IrOpcodeName(opcode).starts_with("Image") || IrOpcodeName(opcode).starts_with("Atomic") || IrOpcodeName(opcode).starts_with("Export");
+    }
+}
+
+std::uint64_t SpeculationKey(const IrValue& write) {
+    std::uint64_t key = static_cast<std::uint64_t>(write.Opcode()) << 40u;
+    if (write.ArgumentCount() > 1u) {
+        const GuestRegister target = write.Argument(0)->Register();
+        key |= (static_cast<std::uint64_t>(target.bank) << 32u) | target.index;
+    }
+    return key;
+}
 
 IrShaderStage toIrShaderStage(ShaderStageKind stage) {
     switch (stage) {
@@ -163,9 +211,47 @@ void includeInstructionVectorRegisters(const RdnaInstruction& instruction, std::
     }
 }
 
-void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateOptions& options) {
+using BlockPredecessors = std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>;
+
+BlockPredecessors blockPredecessors(const ControlFlowGraph& cfg) {
+    BlockPredecessors predecessors;
+    for (const auto& block : cfg.blocks) {
+        for (const auto successor : block.successors) predecessors[successor].push_back(block.id);
+    }
+    return predecessors;
+}
+
+std::unordered_set<std::uint32_t> vectorWindowRegion(const ControlFlowGraph& cfg, const BlockPredecessors& predecessors, const std::unordered_set<std::uint32_t>& relative) {
+    std::unordered_map<std::uint32_t, const BasicBlock*> byId;
+    for (const auto& block : cfg.blocks) byId.emplace(block.id, &block);
+    const auto closure = [&](bool forward) {
+        std::unordered_set<std::uint32_t> seen(relative.begin(), relative.end());
+        std::vector<std::uint32_t> pending(relative.begin(), relative.end());
+        while (!pending.empty()) {
+            const auto id = pending.back();
+            pending.pop_back();
+            const auto found = predecessors.find(id);
+            const auto* next = forward ? &byId.at(id)->successors : found != predecessors.end() ? &found->second : nullptr;
+            if (next == nullptr) continue;
+            for (const auto other : *next) {
+                if (seen.insert(other).second) pending.push_back(other);
+            }
+        }
+        return seen;
+    };
+    const auto reached = closure(true);
+    const auto reaching = closure(false);
+    std::unordered_set<std::uint32_t> region;
+    for (const auto id : reached) {
+        if (reaching.contains(id)) region.insert(id);
+    }
+    return region;
+}
+
+void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateOptions& options, bool vectorWindowActive) {
     IrBuilder entryIr(program);
     entryIr.SetInsertionPoint(entryBlock);
+    entryIr.SetVectorWindowActive(vectorWindowActive);
 
     const auto setVector = [&entryIr, &program](VectorReg reg, IrValue& value) {
         auto& metadata = program.Metadata();
@@ -187,6 +273,10 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
     };
     const auto tessellationBase = [&entryIr](TessellationBaseKind kind) -> IrValue& {
         return entryIr.Emit(IrOpcode::TessellationBase, IrOpcodeType(IrOpcode::TessellationBase), {&entryIr.Constant(static_cast<std::uint32_t>(kind))});
+    };
+    constexpr std::uint32_t MergedHullRecordBytes = 16u;
+    const auto mergedHullRecord = [&entryIr](IrValue& address) -> IrValue& {
+        return entryIr.Emit(IrOpcode::GetTessellationAttribute, IrOpcodeType(IrOpcode::GetTessellationAttribute), {&entryIr.Constant(static_cast<std::uint32_t>(TessellationAttribute::ControlInput)), &address, &entryIr.ConstantBool(true)});
     };
 
     for (std::uint32_t index = 0; index < options.userDataCount; index++) {
@@ -265,7 +355,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             return entryIr.ISub(lhs, minimum(lhs, rhs));
         };
         IrValue& local = builtin(StageInputKind::LocalInvocationIndex);
-        IrValue& firstPrimitive = entryIr.IMul(builtin(StageInputKind::WorkgroupId, 0u), u32(mesh.primitivesPerGroup));
+        IrValue& indexWord = draw(3u);
+        IrValue& group = entryIr.IAdd(builtin(StageInputKind::WorkgroupId, 0u), entryIr.IMul(builtin(StageInputKind::WorkgroupId, 2u), entryIr.ShiftRightLogical(indexWord, u32(MeshLayerStrideShift))));
+        IrValue& firstPrimitive = entryIr.IMul(group, u32(mesh.primitivesPerGroup));
         IrValue& step = u32(stepCount);
         IrValue& firstVertex = entryIr.IMul(firstPrimitive, step);
         IrValue& indirect = entryIr.INotEqual(entryIr.BitwiseOr(draw(MeshArgumentAddressDword), draw(MeshArgumentAddressDword + 1u)), u32(0u));
@@ -276,24 +368,38 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.BitwiseOr(entryIr.ShiftLeftLogical(vertices, u32(12u)), entryIr.ShiftLeftLogical(primitives, u32(22u))));
         IrValue& wave = entryIr.ShiftRightLogical(local, u32(options.waveSize == 32u ? 5u : 6u));
         IrValue& waveBase = entryIr.BitwiseAnd(local, u32(~(options.waveSize - 1u)));
-        IrValue& vertexCount = minimum(subtractSaturate(vertices, waveBase), u32(options.waveSize));
+        IrValue& vertexCount = mesh.capturedInput ? u32(0u) : minimum(subtractSaturate(vertices, waveBase), u32(options.waveSize));
         IrValue& primitiveCount = minimum(subtractSaturate(primitives, waveBase), u32(options.waveSize));
         IrValue& waveInfo = entryIr.BitwiseOr(entryIr.ShiftLeftLogical(wave, u32(24u)), u32((totalThreads / options.waveSize) << 28u));
         entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.BitwiseOr(waveInfo, entryIr.BitwiseOr(entryIr.ShiftLeftLogical(primitiveCount, u32(8u)), vertexCount)));
         const bool strip = mesh.inputPrimitive == kTriStripPrimitiveType;
-        IrValue& indexWord = draw(3u);
+        const bool restartable = strip || fan;
         IrValue& stripPosition = entryIr.IAdd(entryIr.IAdd(firstPrimitive, local), firstIndex);
         IrValue& restartTable = entryIr.INotEqual(entryIr.BitwiseAnd(indexWord, u32(MeshIndexRestartTable)), u32(0u));
-        IrValue& stripStart = strip ? entryIr.Emit(IrOpcode::MeshRestartStart, IrOpcodeType(IrOpcode::MeshRestartStart), {&entryIr.IAdd(stripPosition, u32(2u)), &restartTable}) : u32(0u);
-        IrValue& parity = strip ? entryIr.BitwiseAnd(entryIr.ISub(stripPosition, entryIr.Emit(IrOpcode::UMax32, IrOpcodeType(IrOpcode::UMax32), {&stripStart, &firstIndex})), u32(1u)) : u32(0u);
+        const auto restartStart = [&](IrValue& position) -> IrValue& {
+            return entryIr.Emit(IrOpcode::MeshRestartStart, IrOpcodeType(IrOpcode::MeshRestartStart), {&position, &restartTable});
+        };
+        const auto atLeastFirstIndex = [&](IrValue& position) -> IrValue& {
+            return entryIr.Emit(IrOpcode::UMax32, IrOpcodeType(IrOpcode::UMax32), {&position, &firstIndex});
+        };
+        IrValue& stripStart = restartable ? restartStart(entryIr.IAdd(stripPosition, u32(2u))) : u32(0u);
+        IrValue& parity = strip ? entryIr.BitwiseAnd(entryIr.ISub(stripPosition, atLeastFirstIndex(stripStart)), u32(1u)) : u32(0u);
+        IrValue& groupPosition = entryIr.IAdd(firstPrimitive, firstIndex);
+        IrValue& fanCenter = fan ? atLeastFirstIndex(restartStart(groupPosition)) : u32(0u);
+        IrValue& segmentCenter = fan ? atLeastFirstIndex(stripStart) : u32(0u);
+        IrValue& centerSlot = fan ? entryIr.Select(entryIr.ULessThan(groupPosition, segmentCenter), entryIr.ISub(segmentCenter, groupPosition), u32(0u)) : u32(0u);
         IrValue& vertex = entryIr.IMul(local, step);
         IrValue& item = u32(mesh.esgsItemSize);
         const auto unlessRestarted = [&](IrValue& offset) -> IrValue& {
-            return strip ? entryIr.Select(entryIr.ULessThan(stripPosition, stripStart), entryIr.IMul(vertex, item), offset) : offset;
+            return restartable ? entryIr.Select(entryIr.ULessThan(stripPosition, stripStart), entryIr.IMul(vertex, item), offset) : offset;
         };
-        IrValue& first = fan ? entryIr.IMul(entryIr.IAdd(vertex, u32(1u)), item) : unlessRestarted(entryIr.IMul(entryIr.IAdd(vertex, parity), item));
-        IrValue& second = fan ? entryIr.IMul(entryIr.IAdd(vertex, u32(2u)), item) : size >= 2u ? unlessRestarted(entryIr.IMul(entryIr.ISub(entryIr.IAdd(vertex, u32(1u)), parity), item)) : u32(0u);
-        IrValue& third = fan ? u32(0u) : size == 3u ? unlessRestarted(entryIr.IMul(entryIr.IAdd(vertex, u32(2u)), item)) : u32(0u);
+        const bool last = mesh.provokingVertex != 0u;
+        IrValue& fanSecond = unlessRestarted(entryIr.IMul(entryIr.IAdd(vertex, u32(1u)), item));
+        IrValue& fanThird = unlessRestarted(entryIr.IMul(entryIr.IAdd(vertex, u32(2u)), item));
+        IrValue& fanCenterSlot = unlessRestarted(entryIr.IMul(centerSlot, item));
+        IrValue& first = fan ? (last ? fanCenterSlot : fanSecond) : unlessRestarted(entryIr.IMul(last ? entryIr.IAdd(vertex, parity) : vertex, item));
+        IrValue& second = fan ? (last ? fanSecond : fanThird) : size >= 2u ? unlessRestarted(entryIr.IMul(last ? entryIr.ISub(entryIr.IAdd(vertex, u32(1u)), parity) : entryIr.IAdd(entryIr.IAdd(vertex, u32(1u)), parity), item)) : u32(0u);
+        IrValue& third = fan ? (last ? fanThird : fanCenterSlot) : size == 3u ? unlessRestarted(entryIr.IMul(last ? entryIr.IAdd(vertex, u32(2u)) : entryIr.ISub(entryIr.IAdd(vertex, u32(2u)), parity), item)) : u32(0u);
         setVector(static_cast<VectorReg>(0), entryIr.BitwiseOr(entryIr.BitwiseAnd(first, u32(0xffffu)), entryIr.ShiftLeftLogical(second, u32(16u))));
         setVector(static_cast<VectorReg>(1), entryIr.BitwiseAnd(third, u32(0xffffu)));
         setVector(static_cast<VectorReg>(2), entryIr.IAdd(firstPrimitive, local));
@@ -302,7 +408,27 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         if (options.userDataBaseRegister != 0u || options.userDataCount < 8u) {
             throw std::runtime_error("mesh shader translation requires the merged program's eight hidden user words");
         }
-        IrValue& inputVertex = fan ? entryIr.Select(entryIr.IEqual(local, u32(0u)), u32(0u), entryIr.IAdd(firstVertex, local)) : entryIr.IAdd(firstVertex, local);
+        if (mesh.capturedInput) {
+            IrValue& active = entryIr.ULessThan(local, vertices);
+            IrValue& captured = entryIr.IMul(entryIr.IAdd(firstVertex, local), item);
+            IrValue& slot = entryIr.IMul(local, item);
+            for (std::uint32_t dword = 0; dword < mesh.esgsItemSize; dword++) {
+                IrValue& word = entryIr.Emit(IrOpcode::MeshCapturedWord, IrOpcodeType(IrOpcode::MeshCapturedWord), {&entryIr.IAdd(captured, u32(dword)), &active});
+                const std::uint32_t memoryIndex = static_cast<std::uint32_t>(program.Resources().memoryInfo.size());
+                program.Resources().memoryInfo.push_back(MemoryInfo{.kind = ResourceKind::Lds, .dataDwords = 1u, .dataBits = 32u, .componentCount = 1u});
+                (void)entryIr.Emit(IrOpcode::WriteSharedU32, IrType::Void, {&entryIr.ShiftLeftLogical(entryIr.IAdd(slot, u32(dword)), u32(2u)), &word, &active}, MemoryFlags{.index = memoryIndex});
+            }
+            (void)entryIr.Emit(IrOpcode::Barrier, IrType::Void, {});
+            for (std::uint32_t reg = 4u; reg < 8u; reg++) {
+                entryIr.SetScalarReg(static_cast<ScalarReg>(reg), u32(0u));
+            }
+            for (std::uint32_t reg = 5u; reg < 8u; reg++) {
+                setVector(static_cast<VectorReg>(reg), u32(0u));
+            }
+            setVector(static_cast<VectorReg>(8), builtin(StageInputKind::WorkgroupId, 1u));
+            return;
+        }
+        IrValue& inputVertex = fan ? entryIr.Select(entryIr.IEqual(local, u32(0u)), entryIr.ISub(fanCenter, firstIndex), entryIr.IAdd(firstVertex, local)) : entryIr.IAdd(firstVertex, local);
         IrValue& indexBytes = entryIr.BitwiseAnd(indexWord, u32(0xffu));
         IrValue& indexed = entryIr.INotEqual(indexBytes, u32(0u));
         IrValue& byteOffset = entryIr.IMul(entryIr.IAdd(inputVertex, firstIndex), indexBytes);
@@ -325,6 +451,13 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         setVector(static_cast<VectorReg>(2), drawIndex(StageInputKind::VertexIndex));
         setVector(static_cast<VectorReg>(3), tessellationBase(TessellationBaseKind::RelativeIndex));
         setVector(static_cast<VectorReg>(5), drawIndex(StageInputKind::InstanceIndex));
+        if (options.inputInfo.vertex->tess.mergedHull) {
+            const auto kind = static_cast<std::uint32_t>(TessellationAttribute::LocalOutput);
+            for (const auto [offset, index] : {std::pair{0u, StageInputKind::VertexIndex}, std::pair{4u, StageInputKind::InstanceIndex}}) {
+                static_cast<void>(entryIr.Emit(IrOpcode::SetTessellationAttribute, IrType::Void, {&entryIr.Constant(kind), &entryIr.Constant(offset), &builtin(index), &entryIr.ConstantBool(true)}));
+            }
+            program.Metadata().tessellationLocalStride = MergedHullRecordBytes;
+        }
     } else if (options.stage == ShaderStageKind::TessellationControl) {
         const auto& tess = options.inputInfo.vertex->tess;
         entryIr.SetScalarReg(static_cast<ScalarReg>(2), tessellationBase(TessellationBaseKind::OffChip));
@@ -332,6 +465,14 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(0x81010000u | tess.inputControlPoints | (tess.outputControlPoints << 8u)));
         setVector(static_cast<VectorReg>(0), builtin(StageInputKind::PrimitiveId));
         setVector(static_cast<VectorReg>(1), entryIr.BitwiseOr(entryIr.ShiftLeftLogical(builtin(StageInputKind::InvocationId), entryIr.Constant(8u)), tessellationBase(TessellationBaseKind::RelativeIndex)));
+        if (tess.mergedHull) {
+            IrValue& point = entryIr.Emit(IrOpcode::UMin32, IrOpcodeType(IrOpcode::UMin32), {&builtin(StageInputKind::InvocationId), &entryIr.Constant(tess.inputControlPoints - 1u)});
+            IrValue& record = entryIr.IMul(point, entryIr.Constant(MergedHullRecordBytes));
+            setVector(static_cast<VectorReg>(2), mergedHullRecord(record));
+            setVector(static_cast<VectorReg>(3), entryIr.IAdd(entryIr.IMul(tessellationBase(TessellationBaseKind::RelativeIndex), entryIr.Constant(tess.inputControlPoints)), builtin(StageInputKind::InvocationId)));
+            setVector(static_cast<VectorReg>(5), mergedHullRecord(entryIr.IAdd(record, entryIr.Constant(4u))));
+            program.Metadata().tessellationLocalStride = MergedHullRecordBytes;
+        }
     } else if (options.stage == ShaderStageKind::TessellationEvaluation) {
         entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(64u));
         entryIr.SetScalarReg(static_cast<ScalarReg>(4), tessellationBase(TessellationBaseKind::OffChip));
@@ -344,18 +485,56 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         const auto* ps = options.inputInfo.pixel;
         const auto vgpr = [&](PixelInput input) { return ps->psInputVgpr[static_cast<std::uint32_t>(input)]; };
         const auto loaded = [&](PixelInput input) { return vgpr(input) != ShaderPixelInputInfo::NoPixelInputVgpr; };
-        for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveSample, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::PerspectiveCenter, StageInputKind::BaryCoordSmooth},
-                                         std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::LinearSample, StageInputKind::BaryCoordNoPerspective},
-                                         std::pair{PixelInput::LinearCenter, StageInputKind::BaryCoordNoPerspective}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective}}) {
+        const bool iterated = ps->psIteratesSamples;
+        program.Metadata().pixelIteratesSamples = iterated;
+        const bool offsets = options.interpolationFunctions && options.fragmentShaderBarycentricEnabled;
+        const bool centers = iterated && offsets;
+        if (ps->mergeSamples > 1u && !offsets && ps->SampleLocationsOffCenter() && (loaded(PixelInput::PerspectiveCenter) || loaded(PixelInput::LinearCenter))) {
+            throw std::runtime_error("a partial write of a multisampled packed color target runs the pixel shader once per sample, and without interpolation functions and fragment shader barycentrics its centre-located barycentrics would follow the sample");
+        }
+        const bool sampleOffsets = offsets && ps->SampleLocationsOffCenter();
+        const auto smoothSample = sampleOffsets ? StageInputKind::BaryCoordSmoothSample : StageInputKind::BaryCoordSmooth;
+        const auto linearSample = sampleOffsets ? StageInputKind::BaryCoordNoPerspectiveSample : StageInputKind::BaryCoordNoPerspective;
+        const auto smoothCenter = centers ? StageInputKind::BaryCoordSmoothCenter : StageInputKind::BaryCoordSmooth;
+        const auto linearCenter = centers ? StageInputKind::BaryCoordNoPerspectiveCenter : StageInputKind::BaryCoordNoPerspective;
+        for (const auto [input, kind] : {std::pair{PixelInput::PerspectiveSample, smoothSample}, std::pair{PixelInput::PerspectiveCenter, smoothCenter},
+                                         std::pair{PixelInput::PerspectiveCentroid, StageInputKind::BaryCoordSmooth}, std::pair{PixelInput::LinearSample, linearSample},
+                                         std::pair{PixelInput::LinearCenter, linearCenter}, std::pair{PixelInput::LinearCentroid, StageInputKind::BaryCoordNoPerspective}}) {
             if (!loaded(input)) continue;
             setVector(static_cast<VectorReg>(vgpr(input)), builtin(kind, 0u));
             setVector(static_cast<VectorReg>(vgpr(input) + 1u), builtin(kind, 1u));
         }
+        const auto firstSampleOffset = [&](std::uint32_t component) -> IrValue& {
+            const auto& locations = ps->sampleLocations;
+            if (!ps->SampleLocationsVary()) return entryIr.ConstantF32(SampleLocationOffset(locations[0], component));
+            IrValue& x = entryIr.Emit(IrOpcode::ConvertU32F32, IrType::U32, {&entryIr.BitCastF32(builtin(StageInputKind::FragCoord, 0u))});
+            IrValue& y = entryIr.Emit(IrOpcode::ConvertU32F32, IrType::U32, {&entryIr.BitCastF32(builtin(StageInputKind::FragCoord, 1u))});
+            IrValue& quadPixel = entryIr.BitwiseOr(entryIr.BitwiseAnd(x, entryIr.Constant(1u)), entryIr.ShiftLeftLogical(entryIr.BitwiseAnd(y, entryIr.Constant(1u)), entryIr.Constant(1u)));
+            IrValue* offset = &entryIr.ConstantF32(SampleLocationOffset(locations[24], component));
+            for (std::uint32_t pixel = 3u; pixel-- > 0u;) {
+                offset = &entryIr.Select(entryIr.IEqual(quadPixel, entryIr.Constant(pixel)), entryIr.ConstantF32(SampleLocationOffset(locations[pixel * 8u], component)), *offset);
+            }
+            return *offset;
+        };
+        const auto position = [&](std::uint32_t component) -> IrValue& {
+            IrValue& coordinate = builtin(StageInputKind::FragCoord, component);
+            const auto location = ps->psPositionLocation;
+            if (location == PixelPositionLocation::Centroid || (location == PixelPositionLocation::Center && !iterated) || (location == PixelPositionLocation::Sample && (iterated || !ps->SampleLocationsOffCenter()))) {
+                return coordinate;
+            }
+            IrValue& value = entryIr.BitCastF32(coordinate);
+            if (location == PixelPositionLocation::Sample) {
+                return entryIr.BitCastU32(entryIr.Emit(IrOpcode::FPAdd32, IrOpcodeType(IrOpcode::FPAdd32), {&value, &firstSampleOffset(component)}));
+            }
+            IrValue& corner = entryIr.Emit(IrOpcode::FPFloor32, IrOpcodeType(IrOpcode::FPFloor32), {&value});
+            if (location == PixelPositionLocation::UpperLeft) return entryIr.BitCastU32(corner);
+            return entryIr.BitCastU32(entryIr.Emit(IrOpcode::FPAdd32, IrOpcodeType(IrOpcode::FPAdd32), {&corner, &entryIr.ConstantF32(0.5f)}));
+        };
         if (loaded(PixelInput::PositionX)) {
-            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionX)), builtin(StageInputKind::FragCoord, 0u));
+            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionX)), position(0u));
         }
         if (loaded(PixelInput::PositionY)) {
-            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionY)), builtin(StageInputKind::FragCoord, 1u));
+            setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionY)), position(1u));
         }
         if (loaded(PixelInput::PositionZ)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::PositionZ)), builtin(StageInputKind::FragCoord, 2u));
@@ -374,6 +553,9 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         if (loaded(PixelInput::Ancillary)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::Ancillary)), builtin(StageInputKind::PackedAncillary));
         }
+        if (loaded(PixelInput::SampleCoverage)) {
+            setVector(static_cast<VectorReg>(vgpr(PixelInput::SampleCoverage)), builtin(StageInputKind::SampleMask));
+        }
         if (loaded(PixelInput::LineStipple)) {
             setVector(static_cast<VectorReg>(vgpr(PixelInput::LineStipple)), entryIr.Constant(0u));
         }
@@ -389,15 +571,52 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             entryIr.SetScalarReg(static_cast<ScalarReg>(2), entryIr.Constant((lanes << 12u) | (lanes << 22u)));
             entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(lanes | (lanes << 8u)));
         }
-        setVector(static_cast<VectorReg>(5), drawIndex(StageInputKind::VertexIndex));
-        setVector(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
+        if (options.gcnLegacyVertexInputs) {
+            setVector(static_cast<VectorReg>(0), drawIndex(StageInputKind::VertexIndex));
+            for (std::uint32_t reg = 1u; reg <= 3u; reg++) setVector(static_cast<VectorReg>(reg), drawIndex(StageInputKind::InstanceIndex));
+        } else {
+            setVector(static_cast<VectorReg>(5), drawIndex(StageInputKind::VertexIndex));
+            setVector(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
+        }
     }
 }
 
 }
 
+bool NanSpeculationRestorable(const IrBlock& block, std::size_t firstInstruction) {
+    const auto& instructions = block.Instructions();
+    return std::none_of(std::next(instructions.begin(), static_cast<std::ptrdiff_t>(firstInstruction)), instructions.end(), [](const IrValue* write) { return !SpeculationReader(write->Opcode()).has_value() && WritesSpeculationState(write->Opcode()); });
+}
+
+bool NanSpeculationLaneLocal(const IrBlock& block, std::size_t firstInstruction) {
+    const auto& instructions = block.Instructions();
+    return std::none_of(std::next(instructions.begin(), static_cast<std::ptrdiff_t>(firstInstruction)), instructions.end(), [](const IrValue* value) {
+        switch (value->Opcode()) {
+            case IrOpcode::ReadFirstLane:
+            case IrOpcode::ReadLane:
+            case IrOpcode::Ballot:
+            case IrOpcode::DppMoveU32:
+            case IrOpcode::DppUpdateU32:
+            case IrOpcode::WqmU64:
+            case IrOpcode::Permlane16U32:
+            case IrOpcode::SwizzleU32:
+            case IrOpcode::WindowLaneGuard:
+            case IrOpcode::FPInterpolateF32:
+            case IrOpcode::FPInterpolateF16:
+            case IrOpcode::InterpolateHostP1:
+            case IrOpcode::InterpolateHostP2:
+                return true;
+            default:
+                return false;
+        }
+    });
+}
+
 IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const ControlFlowGraph& cfg, const TranslateOptions& options) const {
     validateTranslateOptions(options);
+    if (cfg.linkEscapeWaveSize == options.waveSize) {
+        throw std::invalid_argument(cfg.linkEscapeReason);
+    }
     if (cfg.blocks.empty()) {
         throw std::runtime_error("cannot translate an empty control flow graph");
     }
@@ -425,6 +644,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     program.SetWaveSize(options.waveSize);
     std::uint32_t windowBase = NumVectorRegs;
     bool indexedWrites = false;
+    std::unordered_set<std::uint32_t> relativeBlocks;
     for (const auto& cfgBlock : cfg.blocks) {
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
@@ -432,16 +652,19 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
             switch (instruction.op) {
                 case RdnaOpcode::VMovrelsB32:
                     windowBase = std::min(windowBase, instruction.source0.reg);
+                    relativeBlocks.insert(cfgBlock.id);
                     break;
                 case RdnaOpcode::VMovreldB32:
                     windowBase = std::min(windowBase, instruction.destination.reg);
                     indexedWrites = true;
+                    relativeBlocks.insert(cfgBlock.id);
                     break;
                 case RdnaOpcode::VMovrelsdB32:
                 case RdnaOpcode::VMovrelsd2B32:
                 case RdnaOpcode::VSwaprelB32:
                     windowBase = std::min({windowBase, instruction.source0.reg, instruction.destination.reg});
                     indexedWrites = true;
+                    relativeBlocks.insert(cfgBlock.id);
                     break;
                 default:
                     break;
@@ -454,6 +677,15 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         program.Metadata().vectorWindowSize = vectorLimit - windowBase;
         program.Metadata().vectorWindowIndexedWrites = indexedWrites;
     }
+    static const bool unscopedWindow = std::getenv("APS5_NO_SCOPED_VECTOR_WINDOW") != nullptr;
+    const auto predecessors = blockPredecessors(cfg);
+    const auto windowRegion = program.Metadata().vectorWindowSize != 0u && !unscopedWindow ? vectorWindowRegion(cfg, predecessors, relativeBlocks) : std::unordered_set<std::uint32_t>{};
+    const bool scopedWindow = !windowRegion.empty() && windowRegion.size() < cfg.blocks.size();
+    const auto syncsWindow = [&](bool toWindow) { return scopedWindow && (toWindow || program.Metadata().vectorWindowIndexedWrites); };
+    const auto syncedOnEntry = [&](std::uint32_t id) {
+        const auto found = predecessors.find(id);
+        return found != predecessors.end() && std::ranges::none_of(found->second, [&](std::uint32_t predecessor) { return windowRegion.contains(predecessor) == windowRegion.contains(id); });
+    };
     program.Resources().stage = toIrShaderStage(options.stage);
     program.Resources().shaderHash = options.shaderHash;
     program.Resources().userDataBase = options.userDataBaseRegister;
@@ -490,18 +722,107 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     blocks.push_back(&program.CreateBlock());
     blockInfos.push_back(BlockInfo{entryBlockId, cfg.blocks.front().startProgramCounter, cfg.blocks.front().startProgramCounter, entryTerminator});
 
+    struct SpeculationRegion {
+        std::uint32_t begin = 0;
+        std::uint32_t end = 0;
+        std::size_t exactIndex = 0;
+        std::size_t mergeIndex = 0;
+    };
+    const auto& speculation = NanSpeculation();
+    const auto pureVector = [&](const RdnaInstruction& instruction) {
+        switch (GetRdnaInstructionFamily(instruction.rawWords[0])) {
+            case RdnaInstructionFamily::VOP1:
+            case RdnaInstructionFamily::VOP2:
+            case RdnaInstructionFamily::VOP3:
+            case RdnaInstructionFamily::VOP3P:
+            case RdnaInstructionFamily::VOPC:
+                break;
+            default:
+                return false;
+        }
+        if (instruction.destination.kind == RdnaOperandKind::ScalarRegister) return false;
+        switch (instruction.op) {
+            case RdnaOpcode::VReadfirstlaneB32:
+            case RdnaOpcode::VReadlaneB32:
+            case RdnaOpcode::VMovreldB32:
+            case RdnaOpcode::VMovrelsB32:
+            case RdnaOpcode::VMovrelsdB32:
+            case RdnaOpcode::VMovrelsd2B32:
+            case RdnaOpcode::VSwaprelB32:
+            case RdnaOpcode::VPermlane16B32:
+            case RdnaOpcode::VPermlanex16B32:
+                return false;
+            default:
+                break;
+        }
+        if (isCodeTableLoad(cfg, instruction.programCounter) || isUnlinkedCall(cfg, instruction.programCounter)) return false;
+        if (cfg.hasFetchCall && instruction.programCounter == cfg.fetchCallProgramCounter) return false;
+        return options.embeddedFetch == nullptr || std::ranges::find(options.embeddedFetch->loads, instruction.programCounter, &EmbeddedFetchLoad::programCounter) == options.embeddedFetch->loads.end();
+    };
+    const auto regionsOf = [&](const BasicBlock& source) {
+        std::vector<SpeculationRegion> regions;
+        if (!speculation.enabled || NanSpeculationSuppressed(options.shaderHash) || UsesTessellationLanes(options.stage) || ((speculation.stageMask >> static_cast<std::uint32_t>(options.stage)) & 1u) == 0u || source.terminator.loopHeader || relativeBlocks.contains(source.id)) return regions;
+        std::uint32_t index = source.instructionBegin;
+        while (index < source.instructionEnd) {
+            if (!pureVector(decoded.instructions[index])) {
+                ++index;
+                continue;
+            }
+            std::uint32_t end = index;
+            while (end < source.instructionEnd && end - index < speculation.maximumVectorInstructions && pureVector(decoded.instructions[end])) ++end;
+            if (end - index >= speculation.stageMinimum[static_cast<std::size_t>(options.stage)]) regions.push_back({index, end});
+            index = end;
+        }
+        return regions;
+    };
+
     std::unordered_map<std::uint32_t, std::size_t> blockIndices;
+    std::unordered_map<std::uint32_t, std::size_t> lastIndices;
+    std::unordered_map<std::uint32_t, std::vector<SpeculationRegion>> regionsByBlock;
     blockIndices.reserve(cfg.blocks.size());
+    std::uint32_t nextBlockId = entryBlockId + 1u;
     for (const auto& sourceBlock : cfg.blocks) {
         if (!blockIndices.emplace(sourceBlock.id, blocks.size()).second) {
             throw std::runtime_error("control flow graph contains duplicate block id " + std::to_string(sourceBlock.id));
         }
+        auto regions = regionsOf(sourceBlock);
+        program.Metadata().nanSpeculationCandidates += static_cast<std::uint32_t>(regions.size());
+        std::size_t current = blocks.size();
         blocks.push_back(&program.CreateBlock());
         blockInfos.push_back(BlockInfo{sourceBlock.id, sourceBlock.startProgramCounter, sourceBlock.endProgramCounter, sourceBlock.terminator});
+        for (auto& region : regions) {
+            const std::uint32_t exactId = nextBlockId++;
+            const std::uint32_t mergeId = nextBlockId++;
+            const std::uint32_t regionStart = decoded.instructions[region.begin].programCounter;
+            const std::uint32_t regionEnd = decoded.instructions[region.end - 1u].programCounter;
+            const Terminator original = blockInfos[current].terminator;
+            Terminator speculative;
+            speculative.kind = TerminatorKind::ConditionalBranch;
+            speculative.condition = BranchCondition::ScalarInstruction;
+            speculative.trueBlock = exactId;
+            speculative.falseBlock = mergeId;
+            speculative.mergeBlock = mergeId;
+            blockInfos[current].terminator = speculative;
+            Terminator rejoin;
+            rejoin.kind = TerminatorKind::Branch;
+            rejoin.trueBlock = mergeId;
+            region.exactIndex = blocks.size();
+            blocks.push_back(&program.CreateBlock());
+            blockInfos.push_back(BlockInfo{exactId, regionStart, regionEnd, rejoin});
+            region.mergeIndex = blocks.size();
+            blocks.push_back(&program.CreateBlock());
+            blockInfos.push_back(BlockInfo{mergeId, regionEnd, sourceBlock.endProgramCounter, original});
+            blocks[current]->AddBranch(blocks[region.exactIndex]);
+            blocks[current]->AddBranch(blocks[region.mergeIndex]);
+            blocks[region.exactIndex]->AddBranch(blocks[region.mergeIndex]);
+            current = region.mergeIndex;
+        }
+        lastIndices.emplace(sourceBlock.id, current);
+        regionsByBlock.emplace(sourceBlock.id, std::move(regions));
     }
 
     for (const auto& sourceBlock : cfg.blocks) {
-        const auto sourceIndex = blockIndices.at(sourceBlock.id);
+        const auto sourceIndex = lastIndices.at(sourceBlock.id);
         for (const auto successor : sourceBlock.successors) {
             const auto target = blockIndices.find(successor);
             if (target == blockIndices.end()) {
@@ -512,9 +833,14 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     }
     blocks.front()->AddBranch(blocks[blockIndices.at(cfg.blocks.front().id)]);
 
-    emitEntryPrologue(program, *blocks.front(), options);
+    emitEntryPrologue(program, *blocks.front(), options, !scopedWindow);
     if (program.Metadata().vectorWindowSize != 0u) {
         vectorLimit = program.Metadata().vectorWindowBase + program.Metadata().vectorWindowSize;
+    }
+    if (scopedWindow && windowRegion.contains(cfg.blocks.front().id)) {
+        IrBuilder entryIr(program);
+        entryIr.SetInsertionPoint(*blocks.front());
+        entryIr.SyncVectorWindow(true);
     }
     if (ancillaryWindow) {
         for (const IrValue* instruction : blocks.front()->Instructions()) {
@@ -524,25 +850,43 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         }
     }
 
-    const auto entryRounding = ComputeEntryRounding(cfg, decoded, options.floatMode.has_value() ? options.floatMode->floatMode : 0u);
+    const auto entryRounding = ComputeEntryRounding(cfg, decoded, options.floatMode.has_value() ? options.floatMode->floatMode : ModeUndeclaredSeed);
     for (const auto& cfgBlock : cfg.blocks) {
         const auto typedIndex = blockIndices.at(cfgBlock.id);
         TranslationContext context(program, *blocks[typedIndex], vectorLimit);
+        if (const auto* workgroup = shaderWorkgroupInput(options.stage, options.inputInfo)) context.SetBufferLdsSize(workgroup->ldsSizeDwords * 4u);
         context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled);
         context.SetFloatMode(options.floatMode);
-        context.SetNativeFloat16(options.nativeFloat16);
+        context.SetNativeFloat16(options.nativeFloat16, options.nativeFloat16Fma, options.float16HostNans);
+        context.SetNativeInteger16(options.nativeInteger16);
+        context.SetFloat32DenormPreserve(options.float32DenormPreserve);
+        context.SetFloat32FlushToZero(options.float32FlushToZero);
+        context.SetFloat32FlushDeclared(options.float32FlushDeclared);
+        context.SetFloat64(options.float64);
+        context.SetSharedVectorRegisters(options.sharedVectorBase, options.sharedVectorCount);
         context.SetEntryRounding(entryRounding.at(cfgBlock.id));
-        for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
+        const bool insideWindow = !scopedWindow || windowRegion.contains(cfgBlock.id);
+        context.SetVectorWindowActive(insideWindow);
+        if (syncsWindow(insideWindow) && syncedOnEntry(cfgBlock.id)) context.SyncVectorWindow(insideWindow);
+        const auto splitPoints = [&](std::uint32_t programCounter, bool afterInstruction) {
+            if (options.splitState == nullptr) return;
+            for (const auto& point : options.splitState->points) {
+                if (point.programCounter == programCounter && point.afterInstruction == afterInstruction) context.TranslateSplitState(*options.splitState, point);
+            }
+        };
+        const auto translateOne = [&](std::uint32_t index) {
             const auto& instruction = decoded.instructions[index];
+            if (index != cfgBlock.instructionBegin) splitPoints(decoded.instructions[index - 1u].programCounter, true);
+            splitPoints(instruction.programCounter, false);
             if (isCodeTableLoad(cfg, instruction.programCounter)) {
                 const auto table = std::find_if(cfg.codeTableLoads.begin(), cfg.codeTableLoads.end(), [&](const auto& entry) { return entry.programCounter == instruction.programCounter; });
                 if (table == cfg.codeTableLoads.end()) throw std::runtime_error("missing shader code table values");
                 context.TranslateCodeTableLoad(instruction, *table);
-                continue;
+                return;
             }
             if (isUnlinkedCall(cfg, instruction.programCounter)) {
                 context.TranslateUnlinkedCall(instruction);
-                continue;
+                return;
             }
             if (options.embeddedFetch != nullptr) {
                 const auto load = std::ranges::find(options.embeddedFetch->loads, instruction.programCounter, &EmbeddedFetchLoad::programCounter);
@@ -553,7 +897,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                     while (attribute < static_cast<std::uint32_t>(vertex.resourcesNum) && vertex.resourcesDst[attribute].attrId != load->attributeId) ++attribute;
                     if (attribute == static_cast<std::uint32_t>(vertex.resourcesNum)) throw std::runtime_error("prepared vertex fetch has no matching semantic");
                     context.TranslateEmbeddedFetch(instruction, attribute, load->componentCount);
-                    continue;
+                    return;
                 }
             }
             context.TranslateInstruction(instruction);
@@ -562,19 +906,110 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                     context.TranslateEmbeddedFetch(fetch, attribute, fetch.dataDwordCount);
                 });
             }
+        };
+        std::size_t currentIndex = typedIndex;
+        const auto& regions = regionsByBlock.at(cfgBlock.id);
+        auto region = regions.begin();
+        for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd;) {
+            if (region == regions.end() || index != region->begin) {
+                translateOne(index++);
+                continue;
+            }
+            IrBlock& fast = *blocks[currentIndex];
+            auto& instructions = fast.Instructions();
+            const auto before = instructions.size();
+            const auto state = context.SaveSpeculationState();
+            const auto checksBefore = program.Metadata().nanSpeculationChecks.size();
+            const auto laneWritesBefore = program.Metadata().nanSpeculationLaneWrites.size();
+            const auto fastOpsBefore = program.Metadata().nanSpeculationFastOps;
+            context.SetNanFast(true);
+            for (std::uint32_t inner = region->begin; inner < region->end; ++inner) translateOne(inner);
+            context.SetNanFast(false);
+            IrValue* seen = context.TakeNanSeen();
+            const auto fastOps = program.Metadata().nanSpeculationFastOps - fastOpsBefore;
+            const auto emitted = static_cast<std::uint64_t>(instructions.size() - before);
+            const bool cheap = seen != nullptr && (fastOps < speculation.minimumFastOps || static_cast<std::uint64_t>(fastOps) * 100u < emitted * speculation.minimumDensityPercent);
+            const bool declined = seen != nullptr && (cheap || !NanSpeculationRestorable(fast, before) || (options.stage == ShaderStageKind::Pixel && !NanSpeculationLaneLocal(fast, before)));
+            if (declined) {
+                while (instructions.size() > before) {
+                    IrValue* dropped = instructions.back();
+                    fast.RemoveInstruction(dropped);
+                    dropped->Invalidate();
+                }
+                program.Metadata().nanSpeculationChecks.resize(checksBefore);
+                program.Metadata().nanSpeculationLaneWrites.resize(laneWritesBefore);
+                program.Metadata().nanSpeculationFastOps = fastOpsBefore;
+                context.RestoreSpeculationState(state);
+                for (std::uint32_t inner = region->begin; inner < region->end; ++inner) translateOne(inner);
+                ++program.Metadata().nanSpeculationDeclines;
+            }
+            if (seen == nullptr && !declined) ++program.Metadata().nanSpeculationClean;
+            if (seen == nullptr || declined) {
+                IrBlock& merge = *blocks[region->mergeIndex];
+                std::erase(fast.Successors(), &merge);
+                std::erase(merge.Predecessors(), &fast);
+                Terminator straight;
+                straight.kind = TerminatorKind::Branch;
+                straight.trueBlock = blockInfos[region->exactIndex].id;
+                blockInfos[currentIndex].terminator = straight;
+                currentIndex = region->mergeIndex;
+                context.SwitchBlock(merge);
+                index = region->end;
+                ++region;
+                continue;
+            }
+            ++program.Metadata().nanSpeculationKept;
+            MarkNanSpeculationApplied(options.shaderHash);
+            IrValue* first = before < instructions.size() ? *std::next(instructions.begin(), static_cast<std::ptrdiff_t>(before)) : nullptr;
+            std::vector<std::pair<IrValue*, IrValue*>> restores;
+            std::unordered_set<std::uint64_t> restored;
+            for (auto position = std::next(instructions.begin(), static_cast<std::ptrdiff_t>(before)); position != instructions.end(); ++position) {
+                IrValue* write = *position;
+                const auto reader = SpeculationReader(write->Opcode());
+                if (!reader.has_value()) continue;
+                if (!restored.insert(SpeculationKey(*write)).second) continue;
+                IrValue& snapshot = program.CreateValue(*reader, IrOpcodeType(*reader));
+                for (std::size_t argument = 0; argument + 1u < write->ArgumentCount(); ++argument) snapshot.AddArgument(write->Argument(argument));
+                fast.InsertInstructionBefore(first, &snapshot);
+                restores.emplace_back(write, &snapshot);
+            }
+            IrBuilder fastIr(program);
+            fastIr.SetInsertionPoint(fast);
+            IrValue& condition = options.stage == ShaderStageKind::Pixel ? *seen : context.WaveAny(*seen);
+            (void)fastIr.Emit(IrOpcode::Reference, IrType::Void, {&condition});
+            blockInfos[currentIndex].condition = &condition;
+            IrBlock& exact = *blocks[region->exactIndex];
+            IrBuilder exactIr(program);
+            exactIr.SetInsertionPoint(exact);
+            for (const auto& [write, snapshot] : restores) {
+                std::vector<IrValue*> arguments;
+                for (std::size_t argument = 0; argument + 1u < write->ArgumentCount(); ++argument) arguments.push_back(write->Argument(argument));
+                arguments.push_back(snapshot);
+                IrValue& set = program.CreateValue(write->Opcode(), IrType::Void);
+                for (IrValue* argument : arguments) set.AddArgument(argument);
+                exact.AppendInstruction(&set);
+            }
+            context.RestoreSpeculationState(state);
+            context.SwitchBlock(exact);
+            for (std::uint32_t inner = region->begin; inner < region->end; ++inner) translateOne(inner);
+            currentIndex = region->mergeIndex;
+            context.SwitchBlock(*blocks[currentIndex]);
+            index = region->end;
+            ++region;
         }
-        context.AddBranchCondition(cfgBlock, blockInfos[typedIndex]);
+        if (cfgBlock.instructionEnd != cfgBlock.instructionBegin) splitPoints(decoded.instructions[cfgBlock.instructionEnd - 1u].programCounter, true);
+        if (syncsWindow(!insideWindow) && std::ranges::any_of(cfgBlock.successors, [&](std::uint32_t successor) { return windowRegion.contains(successor) != insideWindow && !syncedOnEntry(successor); })) {
+            context.SyncVectorWindow(!insideWindow);
+        }
+        context.AddBranchCondition(cfgBlock, blockInfos[currentIndex]);
     }
 
     program.Metadata().blockInfo = std::move(blockInfos);
+    program.Metadata().splitState = options.splitState != nullptr;
     program.BlockOrder() = blocks;
 
     ValidateProgram(program, false);
     return program;
-}
-
-void InstructionTranslator::translateInstruction(IrBuilder& builder, const RdnaInstruction& instruction, const ControlFlowGraph& cfg, const TranslateOptions& options) const {
-    DispatchInstruction(builder, instruction, cfg, options);
 }
 
 TranslationContext::TranslationContext(IrProgram& program, IrBlock& block, std::uint32_t vectorLimit) : program(program), ir(program), block(block), instructionBranchCondition(IrU1(program.CreateValue(IrOpcode::Void, IrType::Bool))), currentVectorLimit(vectorLimit) {

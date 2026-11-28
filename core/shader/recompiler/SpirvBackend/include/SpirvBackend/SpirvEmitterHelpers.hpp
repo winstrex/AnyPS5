@@ -2,7 +2,9 @@
 #define CORE_SHADER_RECOMPILIER_SPIRVBACKEND_INCLUDE_SPIRVBACKEND_SPIRVEMITTERHELPERS_HPP
 
 #include "SpirvBackend/SpirvEmitterState.hpp"
+#include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "Optimization/BindingAllocator.hpp"
+#include <array>
 #include <string>
 
 namespace ShaderRecompiler {
@@ -12,6 +14,8 @@ IrShaderStage StageOf(const SpirvEmitterState& state);
 const ShaderVertexInputInfo& VertexInfo(const SpirvEmitterState& state);
 const ShaderPixelInputInfo& PixelInfo(const SpirvEmitterState& state);
 const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(const SpirvEmitterState& state);
+std::array<std::uint32_t, 3> WorkgroupLocalSize(const SpirvEmitterState& state, const ShaderWorkgroupInputInfo& workgroup);
+std::uint32_t MeshWindowInvocations(const SpirvEmitterState& state);
 const RdnaImageDimensionInfo& RdnaImageDimensionInfoFor(RdnaImageDimension dimension);
 std::uint32_t TypeVoid(SpirvEmitterState& state);
 std::uint32_t TypeBool(SpirvEmitterState& state);
@@ -68,6 +72,7 @@ void DecorateTableNonUniform(SpirvEmitterState& state, std::uint32_t id);
 bool TablePointSampled(const ImageResource& image);
 bool TableModeEmitted(const ImageResource& mode);
 std::uint32_t StorageImageDescriptorPointer(SpirvEmitterState& state, std::uint32_t resource);
+std::uint32_t EmitStorageImageRead(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t coord, std::uint32_t sample);
 void EmitStorageImageWrite(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t mipLod, std::uint32_t coord, std::uint32_t texel, std::uint32_t sample);
 std::uint32_t ExecutionModelForStage(IrShaderStage stage);
 std::uint32_t ConstantI32(SpirvEmitterState& state, std::int32_t value);
@@ -79,7 +84,7 @@ std::uint32_t ConstantU64(SpirvEmitterState& state, std::uint64_t value);
 std::uint32_t ConstantU32CompositeZero(SpirvEmitterState& state, std::uint32_t components);
 std::uint32_t DefineInterfaceVariable(SpirvEmitterState& state, std::uint32_t type, std::uint32_t storage, const char* name);
 void CheckBindings(const IrProgram& program, const CompiledBindingLayout& bindings);
-void EmitBaseHeader(SpirvModule& module, const IrProgram& program);
+void EmitBaseHeader(SpirvModule& module, const IrProgram& program, bool deviceAddressStore = false);
 void DefineInputs(SpirvEmitterState& state);
 void DefineOutputs(SpirvEmitterState& state);
 void DefineDescriptors(SpirvEmitterState& state);
@@ -98,6 +103,7 @@ DppTargetLane EmitDppMirrorTargetLane(SpirvEmitterState& state, std::uint32_t su
 DppTargetLane EmitDppTargetLane(SpirvEmitterState& state, std::uint32_t control);
 std::uint32_t InputVariableForKind(const SpirvEmitterState& state, StageInputKind kind);
 bool OrderedPixelShader(const SpirvEmitterState& state);
+void FlushColorTargetMerge(SpirvEmitterState& state);
 const SpirvInputBinding* SpirvInputBindingForParameter(const SpirvEmitterState& state, std::uint32_t location);
 std::uint32_t EmitVertexParameterComponentU32(SpirvEmitterState& state, const SpirvInputBinding& input, std::uint32_t component);
 std::uint32_t EmitInputComponentU32(SpirvEmitterState& state, StageInputKind kind, std::uint32_t component);
@@ -110,22 +116,39 @@ void EmitMemoryOffsets(SpirvEmitterState& state);
 std::uint32_t LdsDwordCount(const SpirvEmitterState& state);
 bool LdsInDeviceMemory(const SpirvEmitterState& state);
 std::uint32_t LdsMemorySemantics(const SpirvEmitterState& state);
+std::uint32_t LdsMemoryBarrierScope(const SpirvEmitterState& state);
 void EmitLdsBufferBase(SpirvEmitterState& state);
+bool ScratchPoolActive(const SpirvEmitterState& state);
+std::uint32_t ScratchPoolSlotDwords(const SpirvEmitterState& state);
+void DefineScratchPool(SpirvEmitterState& state);
+void EmitScratchPoolAcquire(SpirvEmitterState& state);
+std::uint32_t EmitScratchPoolElementPointer(SpirvEmitterState& state, std::uint32_t index);
+void EmitReturnReleasingScratch(SpirvEmitterState& state);
+void VerifyScratchPoolReturns(const SpirvEmitterState& state, const std::vector<std::uint32_t>& words);
 std::uint32_t EmitLdsLockPointer(SpirvEmitterState& state);
+std::uint32_t EmitAtomicLockPointer(SpirvEmitterState& state, std::uint32_t index);
+std::uint32_t EmitQwordAtomicLockPointer(SpirvEmitterState& state, std::uint32_t guest);
+std::uint32_t EmitLdsBufferU64Pointer(SpirvEmitterState& state, std::uint32_t index);
 MemoryResourceAccess PrepareMemoryResourceAccess(SpirvEmitterState& state, const MemoryInfo& mem);
 std::uint32_t EmitMemoryElementIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t rawIndex);
 std::uint32_t EmitMemoryElementInBounds(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
 bool InFunctionStorage(const SpirvEmitterState& state, ResourceKind kind);
 std::uint32_t EmitMemoryElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index);
+std::uint32_t EmitValueOrZero(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t value);
+std::uint32_t LdsStorageDwords(const SpirvEmitterState& state);
+bool LoadsSelectable(const SpirvEmitterState& state, const MemoryResourceAccess& access);
+std::uint32_t GuardedElementIndex(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t condition, std::uint32_t index);
 std::uint32_t EmitStorageBufferElementPointer(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index, std::uint32_t pointerType);
 std::uint32_t EmitTBufferBitcastU32ToI32(SpirvEmitterState& state, std::uint32_t value);
 bool IsSignedFormatComponent(SpirvFormatComponentType type);
 std::uint32_t EmitUFloatToF32Bits(SpirvEmitterState& state, std::uint32_t raw, std::uint32_t bits);
 std::uint32_t NormalizeFormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t raw);
+std::uint32_t NormalizeFormatComponentWidth(SpirvEmitterState& state, SpirvFormatComponentType type, std::uint32_t bits, std::uint32_t raw);
 std::uint32_t EmitD16FormatComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t raw);
 std::uint32_t EmitFormatStoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t data);
 std::uint32_t EmitD16StoreComponent(SpirvEmitterState& state, const SpirvBufferFormatInfo& info, std::uint32_t component, std::uint32_t half);
 void EmitDeviceAtomicMemoryBarrier(SpirvEmitterState& state);
+void EmitDeviceAtomicMemoryBarrier(SpirvEmitterState& state, std::uint32_t memorySemantics);
 std::uint32_t EmitDsSwizzleTargetLane(SpirvEmitterState& state, std::uint32_t subid, std::uint32_t control);
 std::uint32_t EmitAndConstant(SpirvEmitterState& state, std::uint32_t value, std::uint32_t mask);
 std::uint32_t EmitShiftRightConstant(SpirvEmitterState& state, std::uint32_t value, std::uint32_t shift);
@@ -144,9 +167,12 @@ void EmitF16DenormPreserve(SpirvEmitterState& state);
 std::uint32_t EmitF16BitsToF32(SpirvEmitterState& state, std::uint32_t bits);
 std::uint32_t EmitF16BitsToF32AnyNan(SpirvEmitterState& state, std::uint32_t bits);
 std::uint32_t EmitF16BitsToF32Decoded(SpirvEmitterState& state, std::uint32_t bits);
+bool SignExtendedU32(const IrValue& root);
 void EmitProgram(SpirvEmitterState& state);
 void DefineGetBdaPointer(SpirvEmitterState& state);
 void DefineDot2F32F16Function(SpirvEmitterState& state);
+void DefineIntegerFloat64Functions(SpirvEmitterState& state);
+void DefineReciprocalCorrectionFunction(SpirvEmitterState& state);
 void EmitLabel(SpirvEmitterState& state, std::uint32_t label);
 std::uint32_t Unary(SpirvEmitterState& state, std::uint32_t opcode, std::uint32_t type, std::uint32_t value);
 std::uint32_t Binary(SpirvEmitterState& state, std::uint32_t opcode, std::uint32_t type, std::uint32_t lhs, std::uint32_t rhs);
@@ -154,8 +180,8 @@ std::uint32_t Select(SpirvEmitterState& state, std::uint32_t type, std::uint32_t
 std::uint32_t AtomicIncrement(SpirvEmitterState& state, std::uint32_t old, std::uint32_t limit);
 std::uint32_t AtomicDecrement(SpirvEmitterState& state, std::uint32_t old, std::uint32_t limit);
 std::uint32_t AtomicUSubSat(SpirvEmitterState& state, std::uint32_t old, std::uint32_t value);
-std::uint32_t AtomicFloatMinMax(SpirvEmitterState& state, std::uint32_t old, std::uint32_t source, bool maxValue);
-std::uint32_t AtomicFloatCompareSwap(SpirvEmitterState& state, std::uint32_t old, std::uint32_t desired, std::uint32_t comparator);
+std::uint32_t AtomicFloatMinMax(SpirvEmitterState& state, std::uint32_t old, std::uint32_t source, bool maxValue, bool flush);
+std::uint32_t AtomicFloatCompareSwap(SpirvEmitterState& state, std::uint32_t old, std::uint32_t desired, std::uint32_t comparator, bool flush);
 
 template<std::uint32_t TOpcode, IrType TValueType, typename... TArguments>
 std::uint32_t EmitNative(SpirvEmitterState& state, TArguments... arguments) {
@@ -236,6 +262,12 @@ std::uint32_t EmitValueIfElse(SpirvEmitterState& state, std::uint32_t condition,
 
 template<typename TFunction>
 std::uint32_t AtomicUpdateTyped(SpirvEmitterState& state, std::uint32_t pointer, ResourceKind kind, std::uint32_t type, TFunction&& function) {
+    if (kind == ResourceKind::Scratch && ScratchPoolActive(state)) {
+        const auto previous = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, type, previous, pointer);
+        state.module.AddFunction(spv::OpStore, pointer, function(previous));
+        return previous;
+    }
     const auto scope = kind == ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
     const auto memory = [&]() -> std::uint32_t {
         switch (kind) {
@@ -256,7 +288,11 @@ std::uint32_t AtomicUpdateTyped(SpirvEmitterState& state, std::uint32_t pointer,
     const auto exchanged = state.module.AllocateId();
     state.module.AddFunction(spv::OpBranch, preheader);
     EmitLabel(state, preheader);
-    state.module.AddFunction(spv::OpAtomicLoad, type, initial, pointer, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsMaskNone));
+    if (kind == ResourceKind::Image && type != TypeU32(state)) {
+        state.module.AddFunction(spv::OpAtomicIAdd, type, initial, pointer, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsMaskNone), state.module.Constant(spv::OpConstant, type, 0u, 0u));
+    } else {
+        state.module.AddFunction(spv::OpAtomicLoad, type, initial, pointer, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsMaskNone));
+    }
     state.module.AddFunction(spv::OpBranch, header);
     EmitLabel(state, header);
     state.module.AddFunction(spv::OpPhi, type, observed, initial, preheader, exchanged, cont);
@@ -269,13 +305,102 @@ std::uint32_t AtomicUpdateTyped(SpirvEmitterState& state, std::uint32_t pointer,
     EmitLabel(state, cont);
     state.module.AddFunction(spv::OpBranch, header);
     EmitLabel(state, merge);
-    state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+    if (kind == ResourceKind::Lds) {
+        if (!state.insideLdsLock) state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, LdsMemoryBarrierScope(state)), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+    } else {
+        EmitDeviceAtomicMemoryBarrier(state, memory);
+    }
     return observed;
 }
 
 template<typename TFunction>
 std::uint32_t AtomicUpdate(SpirvEmitterState& state, std::uint32_t pointer, ResourceKind kind, TFunction&& function) {
     return AtomicUpdateTyped(state, pointer, kind, TypeU32(state), std::forward<TFunction>(function));
+}
+
+template<typename TUpdate>
+std::uint32_t LockedDeviceUpdate(SpirvEmitterState& state, std::uint32_t lock, std::uint32_t type, std::uint32_t zero, TUpdate&& update) {
+    const auto entry = state.currentLabel;
+    const auto header = state.module.AllocateId();
+    const auto body = state.module.AllocateId();
+    const auto pending = state.module.AllocateId();
+    const auto attempt = state.module.AllocateId();
+    const auto attemptMerge = state.module.AllocateId();
+    const auto critical = state.module.AllocateId();
+    const auto servedMerge = state.module.AllocateId();
+    const auto pendingMerge = state.module.AllocateId();
+    const auto cont = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    const auto done = state.module.AllocateId();
+    const auto result = state.module.AllocateId();
+    const auto doneNext = state.module.AllocateId();
+    const auto resultNext = state.module.AllocateId();
+    const auto fence = [&] {
+        state.module.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsImageMemoryMask));
+    };
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, header);
+    state.module.AddFunction(spv::OpPhi, TypeBool(state), done, ConstantBool(state, false), entry, doneNext, cont);
+    state.module.AddFunction(spv::OpPhi, type, result, zero, entry, resultNext, cont);
+    state.module.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+    state.module.AddFunction(spv::OpBranch, body);
+    EmitLabel(state, body);
+    state.module.AddFunction(spv::OpSelectionMerge, pendingMerge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, done, pendingMerge, pending);
+    EmitLabel(state, pending);
+    const auto elected = state.module.AllocateId();
+    EmitSubgroupElect(state, elected);
+    state.module.AddFunction(spv::OpSelectionMerge, servedMerge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, elected, attempt, servedMerge);
+    EmitLabel(state, attempt);
+    const auto previous = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), previous, lock, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u), ConstantU32(state, 0u));
+    const auto acquired = state.module.AllocateId();
+    state.module.AddFunction(spv::OpIEqual, TypeBool(state), acquired, previous, ConstantU32(state, 0u));
+    state.module.AddFunction(spv::OpSelectionMerge, attemptMerge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, acquired, critical, attemptMerge);
+    EmitLabel(state, critical);
+    fence();
+    const auto old = update();
+    fence();
+    const auto released = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAtomicExchange, TypeU32(state), released, lock, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 0u));
+    const auto criticalExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, attemptMerge);
+    EmitLabel(state, attemptMerge);
+    const auto attempted = state.module.AllocateId();
+    const auto attemptedResult = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, TypeBool(state), attempted, ConstantBool(state, true), criticalExit, ConstantBool(state, false), attempt);
+    state.module.AddFunction(spv::OpPhi, type, attemptedResult, old, criticalExit, result, attempt);
+    state.module.AddFunction(spv::OpBranch, servedMerge);
+    EmitLabel(state, servedMerge);
+    const auto served = state.module.AllocateId();
+    const auto servedResult = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, TypeBool(state), served, attempted, attemptMerge, ConstantBool(state, false), pending);
+    state.module.AddFunction(spv::OpPhi, type, servedResult, attemptedResult, attemptMerge, result, pending);
+    state.module.AddFunction(spv::OpBranch, pendingMerge);
+    EmitLabel(state, pendingMerge);
+    state.module.AddFunction(spv::OpPhi, TypeBool(state), doneNext, served, servedMerge, done, body);
+    state.module.AddFunction(spv::OpPhi, type, resultNext, servedResult, servedMerge, result, body);
+    const auto waiting = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLogicalNot, TypeBool(state), waiting, doneNext);
+    const auto ballot = state.module.AllocateId();
+    EmitHostSubgroupBallot(state, ballot, waiting);
+    std::uint32_t remaining = ConstantU32(state, 0u);
+    for (std::uint32_t component = 0; component < 4u; ++component) {
+        const auto word = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, ballot, component);
+        const auto combined = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBitwiseOr, TypeU32(state), combined, remaining, word);
+        remaining = combined;
+    }
+    const auto again = state.module.AllocateId();
+    state.module.AddFunction(spv::OpINotEqual, TypeBool(state), again, remaining, ConstantU32(state, 0u));
+    state.module.AddFunction(spv::OpBranchConditional, again, cont, merge);
+    EmitLabel(state, cont);
+    state.module.AddFunction(spv::OpBranch, header);
+    EmitLabel(state, merge);
+    return resultNext;
 }
 
 }

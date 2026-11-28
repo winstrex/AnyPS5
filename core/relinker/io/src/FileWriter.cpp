@@ -4,10 +4,12 @@
 #include <filesystem>
 #include <fstream>
 #include <system_error>
-#ifndef _WIN32
-#include <cerrno>
 #include <random>
 #include <string_view>
+#ifdef _WIN32
+#include "WindowsFileOutput.hpp"
+#else
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -33,11 +35,10 @@ int createTemporary(const std::filesystem::path& target, const mode_t mode, std:
     constexpr std::string_view characters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     std::random_device device;
     for (int attempt = 0; attempt < 100; ++attempt) {
-        std::string suffix = ".";
+        std::string suffix = ".anyps5-";
         for (int index = 0; index < 6; ++index)
             suffix += characters[device() % characters.size()];
-        temporary = target;
-        temporary += suffix;
+        temporary = target.parent_path() / suffix;
         const int descriptor = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode);
         if (descriptor >= 0 || errno != EEXIST)
             return descriptor;
@@ -58,9 +59,14 @@ bool writeAll(const int descriptor, const char* data, std::size_t size) {
     return true;
 }
 
-bool replaceFile(const std::filesystem::path& target, const std::string& path, const char* data, const std::size_t size) {
+bool replaceFile(std::filesystem::path target, const std::string& path, const char* data, const std::size_t size) {
     std::error_code error;
-    const auto previous = std::filesystem::symlink_status(target, error);
+    auto previous = std::filesystem::symlink_status(target, error);
+    if (std::filesystem::is_symlink(previous)) {
+        target = std::filesystem::canonical(target, error);
+        if (error) return false;
+        previous = std::filesystem::symlink_status(target, error);
+    }
     const bool regular = std::filesystem::is_regular_file(previous);
     if (!regular && previous.type() != std::filesystem::file_type::not_found)
         return false;
@@ -68,11 +74,11 @@ bool replaceFile(const std::filesystem::path& target, const std::string& path, c
     std::filesystem::path temporary;
     const int descriptor = createTemporary(target, mode, temporary);
     if (descriptor < 0)
-        return false;
+        throw Domain::RelinkerException("Cannot open output file: " + path);
     if (regular && fchmod(descriptor, mode) != 0) {
         close(descriptor);
         std::filesystem::remove(temporary, error);
-        return false;
+        throw Domain::RelinkerException("Cannot open output file: " + path);
     }
     const bool written = writeAll(descriptor, data, size);
     if (close(descriptor) != 0 || !written) {
@@ -83,13 +89,16 @@ bool replaceFile(const std::filesystem::path& target, const std::string& path, c
     if (!error)
         return true;
     std::filesystem::remove(temporary, error);
-    return false;
+    throw Domain::RelinkerException("Cannot replace output file: " + path);
 }
 #endif
 
 void writeOutput(const std::string& path, const std::ios::openmode mode, const char* data, const std::size_t size) {
     const auto target = NativePath(path);
-#ifndef _WIN32
+#ifdef _WIN32
+    if (Detail::ReplaceWindowsFile(target, path, mode, data, size))
+        return;
+#else
     if (replaceFile(target, path, data, size))
         return;
 #endif

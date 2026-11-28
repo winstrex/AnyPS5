@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -172,7 +173,7 @@ public:
             output << " execute_to_flip_packet_ms=" << milliseconds(flipReached - executionStart);
             output << " flip_packet_to_complete_ms=" << milliseconds(finished - flipReached);
             auto accounted = Clock::duration::zero();
-            for (const auto scope : {"Driver.Packet", "Driver.Suspend", "Driver.WorkerWait", "Driver.Completion", "Driver.EndSubmission", "Driver.Rewind"}) {
+            for (const auto scope : {"Driver.Packet", "Driver.Suspend", "Driver.WorkerWait", "Driver.Completion", "Driver.EndSubmission", "Driver.Rewind", "Driver.FinisherDrain"}) {
                 const auto it = metrics.find({scope, "total"});
                 if (it != metrics.end()) accounted += it->second.total;
             }
@@ -206,7 +207,7 @@ private:
         return std::chrono::duration<double, std::milli>(elapsed).count();
     }
 
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     bool localMetrics = false;
     std::map<std::pair<std::string_view, std::string_view>, Metric> metrics;
     std::map<std::pair<std::string_view, std::string_view>, Metric> asyncMetrics;

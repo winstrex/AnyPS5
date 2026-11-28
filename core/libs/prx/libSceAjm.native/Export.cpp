@@ -1,15 +1,59 @@
+#include "prx/libc/include/general/ExportMacros.hpp"
+#include "prx/libSceAjm.native/include/InventoryExports.hpp"
+#include "prx/libSceAjm.native/include/Api.hpp"
 #include <cstdint>
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 // Entry points this library does not implement: reported before the unimplemented-call exception so an
 // APS5_TRACE_AJM run shows which one a title reached.
 static void AjmStub(const char* name) {
     std::fprintf(stderr, "[ajm] unimplemented %s called\n", name);
     NotImplemented_nid_no_patch(name);
+}
+
+static_assert(sizeof(WVorbisHeaderPacketParameter) == 72);
+static_assert(offsetof(WVorbisHeaderPacketParameter, setupPacket) == 32);
+static_assert(sizeof(WVorbisSetupPacketParameter) == 56);
+static_assert(offsetof(WVorbisSetupPacketParameter, input) == 16);
+
+namespace {
+
+constexpr int AJM_WVORBIS_ERROR_INVALID_PARAMETER = static_cast<int>(0x8A6E0001);
+constexpr int AJM_WVORBIS_ERROR_INVALID_SIZE = static_cast<int>(0x8A6E0002);
+constexpr int AJM_WVORBIS_ERROR_OUTPUT_TOO_SMALL = static_cast<int>(0x8A6E0003);
+constexpr int AJM_WVORBIS_ERROR_INVALID_SETUP = static_cast<int>(0x8A6E0004);
+constexpr std::size_t WVORBIS_LENGTH_TABLE_SIZE = 10;
+constexpr std::size_t VORBIS_IDENTIFICATION_SIZE = 30;
+constexpr std::size_t VORBIS_COMMENT_SIZE = 16;
+constexpr std::size_t WVORBIS_SETUP_MIN_SIZE = 9;
+constexpr std::size_t WVORBIS_SETUP_PART1_LENGTH_OFFSET = 7;
+constexpr std::size_t WVORBIS_LENGTH_FIELD_MAX = 0xFFFF;
+constexpr std::size_t WVORBIS_SETUP_MAX_SIZE = 2 * WVORBIS_LENGTH_FIELD_MAX;
+constexpr std::int32_t VORBIS_BLOCK_SIZE_MIN = 64;
+constexpr std::int32_t VORBIS_BLOCK_SIZE_MAX = 8192;
+constexpr std::uint8_t VORBIS_MAGIC[] {'v', 'o', 'r', 'b', 'i', 's'};
+
+std::int32_t WVorbisBlockSize(std::int32_t log2) {
+    return static_cast<std::int32_t>(1u << (static_cast<std::uint32_t>(log2) & 31u));
+}
+
+std::uint8_t* PutLittle(std::uint8_t* out, std::uint32_t value, std::size_t bytes) {
+    for (std::size_t i = 0; i < bytes; ++i) out[i] = static_cast<std::uint8_t>(value >> (8 * i));
+    return out + bytes;
+}
+
+std::uint8_t* PutVorbisHeaderStart(std::uint8_t* out, std::uint8_t type) {
+    *out++ = type;
+    std::memcpy(out, VORBIS_MAGIC, sizeof(VORBIS_MAGIC));
+    return out + sizeof(VORBIS_MAGIC);
+}
+
 }
 
 extern "C" {
@@ -27,19 +71,145 @@ int APS5_VABI sceAjmBatchJobEncode(AjmBatchInfo* info, uint32_t instance, const 
 }
 
 const char* APS5_VABI sceAjmStrError(int error) {
- (void)error;
- AjmStub(__func__);
- return nullptr;
+    static const char* const messages[] = {
+        "context does not exist",
+        "instance does not exist",
+        "batch does not exist",
+        "invalid parameter",
+        "not enough memory",
+        "not enough resources",
+        "codec is not supported",
+        "codec is already registered in the context",
+        "codec is not registered in the context",
+        "wrong revision in the flags",
+        "flag is not supported",
+        "busy",
+        "priority is invalid",
+        "in progress",
+        "operation cannot be performed at the moment",
+        "malformed batch",
+        "error at job creation",
+        "invalid opcode",
+        "priority violation",
+        "buffer is too big",
+        "invalid address",
+        "batch was cancelled",
+        "specified memory area is already registered",
+        "specified memory area is not registered",
+    };
+    if (error == 0) return "ok";
+    const std::uint32_t index = static_cast<std::uint32_t>(error) - 0x80930002u;
+    if (index < sizeof(messages) / sizeof(messages[0])) return messages[index];
+    return "(unknown)";
 }
 
-int APS5_VABI sceAjmDecWVorbisCreateHeaderPacket(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceAjmDecWVorbisCreateHeaderPacket(WVorbisHeaderPacketParameter* param) {
+    if (param == nullptr) return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    WVorbisHeaderPacketParameter p{};
+    if (!GuestCopyIn_nid_no_patch(&p, param, sizeof(p))) return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    if (p.size != sizeof(WVorbisHeaderPacketParameter)) return AJM_WVORBIS_ERROR_INVALID_SIZE;
+    if (p.bytesPerSecond < 0) return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    if (WVorbisBlockSize(p.shortBlockExponent) < VORBIS_BLOCK_SIZE_MIN) return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    if (p.longBlockExponent < p.shortBlockExponent || WVorbisBlockSize(p.longBlockExponent) > VORBIS_BLOCK_SIZE_MAX)
+        return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    if (p.setupPacket == nullptr) return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    if (p.setupPacketSize < WVORBIS_SETUP_MIN_SIZE || p.setupPacketSize > WVORBIS_SETUP_MAX_SIZE) return AJM_WVORBIS_ERROR_INVALID_SETUP;
+    if (p.output == nullptr) return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    constexpr std::size_t headers = WVORBIS_LENGTH_TABLE_SIZE + VORBIS_IDENTIFICATION_SIZE + VORBIS_COMMENT_SIZE;
+    if (p.outputCapacity < headers || p.setupPacketSize > p.outputCapacity - headers) return AJM_WVORBIS_ERROR_OUTPUT_TOO_SMALL;
+
+    std::vector<std::uint8_t> setup(p.setupPacketSize);
+    if (!GuestCopyIn_nid_no_patch(setup.data(), p.setupPacket, setup.size())) return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    const auto part1 = static_cast<std::uint16_t>(setup[WVORBIS_SETUP_PART1_LENGTH_OFFSET] | setup[WVORBIS_SETUP_PART1_LENGTH_OFFSET + 1] << 8);
+    if (part1 > p.setupPacketSize || p.setupPacketSize - part1 > WVORBIS_LENGTH_FIELD_MAX) return AJM_WVORBIS_ERROR_INVALID_SETUP;
+
+    std::vector<std::uint8_t> packet(headers + p.setupPacketSize);
+    auto* out = packet.data();
+    out = PutLittle(out, 0, 2);
+    out = PutLittle(out, VORBIS_IDENTIFICATION_SIZE, 2);
+    out = PutLittle(out, VORBIS_COMMENT_SIZE, 2);
+    out = PutLittle(out, part1, 2);
+    out = PutLittle(out, static_cast<std::uint32_t>(p.setupPacketSize - part1), 2);
+
+    out = PutVorbisHeaderStart(out, 1);
+    out = PutLittle(out, 0, 4);
+    out = PutLittle(out, static_cast<std::uint32_t>(p.channels), 1);
+    out = PutLittle(out, p.sampleRate, 4);
+    out = PutLittle(out, 0, 4);
+    out = PutLittle(out, static_cast<std::uint32_t>(p.bytesPerSecond) * 8u, 4);
+    out = PutLittle(out, 0, 4);
+    *out++ = static_cast<std::uint8_t>((p.shortBlockExponent & 0xF) | (p.longBlockExponent & 0xF) << 4);
+    *out++ = 1;
+
+    out = PutVorbisHeaderStart(out, 3);
+    out = PutLittle(out, 0, 4);
+    out = PutLittle(out, 0, 4);
+    *out++ = 1;
+
+    std::memcpy(out, setup.data(), p.setupPacketSize);
+    const std::size_t finalOutputSize = headers + p.setupPacketSize;
+    const std::size_t previousOutputSize = p.outputSize;
+    if (!GuestCopyOut_nid_no_patch(&param->outputSize, &finalOutputSize, sizeof(finalOutputSize))) {
+        return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    }
+    if (!GuestCopyOut_nid_no_patch(p.output, packet.data(), finalOutputSize)) {
+        GuestCopyOut_nid_no_patch(&param->outputSize, &previousOutputSize, sizeof(previousOutputSize));
+        return AJM_WVORBIS_ERROR_INVALID_PARAMETER;
+    }
     return 0;
 }
 
-int APS5_VABI sceAjmDecWVorbisCreateSetupPacket(void) {
+int APS5_VABI sceAjmDecWVorbisCreateSetupPacket(WVorbisSetupPacketParameter* parameter) {
+    constexpr int InvalidParameter = static_cast<int>(0x8A6E0001u);
+    constexpr int InvalidSize = static_cast<int>(0x8A6E0002u);
+    if (parameter == nullptr) return InvalidParameter;
+    if (parameter->size != sizeof(WVorbisSetupPacketParameter)) return InvalidSize;
+    if (parameter->channels < 0 || parameter->input == nullptr || parameter->output == nullptr) return InvalidParameter;
     NotImplemented_nid_no_patch(__func__);
-    return 0;
 }
+
+uint32_t APS5_VABI sceAjmInstanceCodecType(uint32_t instance_id) {
+    return instance_id >> 14;
+}
+
+
+}
+
+extern "C" {
+
+int APS5_VABI libSceAjm_nativeUnknown_IfQ_minus_AhcmW9k_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("IfQ-AhcmW9k", libSceAjm_nativeUnknown_IfQ_minus_AhcmW9k_nid_no_patch);
+
+int APS5_VABI libSceAjm_nativeUnknown_JAPya_minus_QyJlU_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("JAPya-QyJlU", libSceAjm_nativeUnknown_JAPya_minus_QyJlU_nid_no_patch);
+
+int APS5_VABI libSceAjm_nativeUnknown_MgTTRx1YSFw_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("MgTTRx1YSFw", libSceAjm_nativeUnknown_MgTTRx1YSFw_nid_no_patch);
+
+int APS5_VABI libSceAjm_nativeUnknown_POOw6Y5luA8_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("POOw6Y5luA8", libSceAjm_nativeUnknown_POOw6Y5luA8_nid_no_patch);
+
+int APS5_VABI libSceAjm_nativeUnknown_mKgie3ed4ao_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("mKgie3ed4ao", libSceAjm_nativeUnknown_mKgie3ed4ao_nid_no_patch);
+
+int APS5_VABI libSceAjm_nativeUnknown_mwtwIZb60YM_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("mwtwIZb60YM", libSceAjm_nativeUnknown_mwtwIZb60YM_nid_no_patch);
+
+int APS5_VABI libSceAjm_nativeUnknown_qkuXdR4_minus_Ihc_nid_no_patch() {
+    NotImplemented_nid_no_patch(__func__);
+}
+APS5_EXPORT("qkuXdR4-Ihc", libSceAjm_nativeUnknown_qkuXdR4_minus_Ihc_nid_no_patch);
 
 }

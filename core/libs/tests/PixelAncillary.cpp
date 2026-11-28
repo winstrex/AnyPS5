@@ -14,6 +14,7 @@ static void Require(bool value) { if (!value) throw std::runtime_error("packed p
 
 constexpr std::uint32_t UnmodelledBits = 0xE000F0FFu;
 constexpr std::uint32_t SelectOther = 0x5A3C9E17u;
+static bool Iterated = true;
 
 struct Row {
     std::uint32_t sample;
@@ -41,6 +42,7 @@ static void RequireField(const IrValue& user, StageInputKind kind, std::uint32_t
 
 static IrBlock& Begin(IrProgram& program) {
     program.Resources().stage = IrShaderStage::Pixel;
+    program.Metadata().pixelIteratesSamples = Iterated;
     program.Resources().resourceTrackingComplete = true;
     auto& block = program.CreateBlock();
     program.SetEntryBlock(block);
@@ -71,6 +73,14 @@ static IrValue& Build(IrProgram& program, IrOpcode opcode, std::uint32_t offset,
     End(builder, user);
     return user;
 }
+static const IrValue* Referenced(const IrProgram& program) {
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() == IrOpcode::ReferenceU32) return inst->Argument(0)->Resolve();
+        }
+    }
+    return nullptr;
+}
 static void Lower(IrProgram& program) {
     ConstantFolder().Fold(program);
     DeadCodeEliminator().RemoveIdentities(program);
@@ -81,6 +91,7 @@ static void Lower(IrProgram& program) {
 static void ExtractVector(std::uint32_t offset, std::uint32_t count, StageInputKind kind, std::uint32_t fieldOffset) {
     IrProgram program;
     program.Resources().stage = IrShaderStage::Pixel;
+    program.Metadata().pixelIteratesSamples = Iterated;
     program.Resources().resourceTrackingComplete = true;
     auto& block = program.CreateBlock();
     program.SetEntryBlock(block);
@@ -102,6 +113,7 @@ static void ExtractVector(std::uint32_t offset, std::uint32_t count, StageInputK
 static void ExtractVectorMaskedCopy(std::uint32_t offset, std::uint32_t count, StageInputKind kind, std::uint32_t fieldOffset) {
     IrProgram program;
     program.Resources().stage = IrShaderStage::Pixel;
+    program.Metadata().pixelIteratesSamples = Iterated;
     program.Resources().resourceTrackingComplete = true;
     auto& block = program.CreateBlock();
     program.SetEntryBlock(block);
@@ -177,15 +189,16 @@ static std::uint32_t Evaluate(const IrValue* value, const Row& row) {
     throw std::runtime_error("packed pixel ancillary evaluation reached an unsupported value");
 }
 static std::uint32_t PackedWord(const Row& row) {
-    return UnmodelledBits | (row.sample << 8u) | (row.layerExported ? row.layer << 16u : 0u);
+    return UnmodelledBits | ((Iterated ? row.sample : 0u) << 8u) | (row.layerExported ? row.layer << 16u : 0u);
 }
 static void Values(IrOpcode opcode, std::uint32_t offset, std::uint32_t count, bool throughSelect) {
     IrProgram program;
-    auto& user = Build(program, opcode, offset, count, throughSelect);
+    static_cast<void>(Build(program, opcode, offset, count, throughSelect));
     Lower(program);
+    const IrValue* used = Referenced(program);
     for (const Row& row : Rows) {
         const std::uint32_t word = throughSelect && !row.frontFacing ? SelectOther : PackedWord(row);
-        Require(Evaluate(&user, row) == BitField(word, offset, count, opcode == IrOpcode::BitFieldSExtract));
+        Require(Evaluate(used, row) == BitField(word, offset, count, opcode == IrOpcode::BitFieldSExtract));
     }
 }
 static void LateFold() {
@@ -241,11 +254,12 @@ static IrValue& Merged(IrProgram& program, IrOpcode opcode, std::uint32_t offset
 }
 static void MergedValues(IrOpcode opcode, std::uint32_t offset, std::uint32_t count, bool loop) {
     IrProgram program;
-    auto& user = Merged(program, opcode, offset, count, loop);
+    static_cast<void>(Merged(program, opcode, offset, count, loop));
     Lower(program);
+    const IrValue* used = Referenced(program);
     for (const Row& row : Rows) {
         const std::uint32_t word = row.frontFacing ? PackedWord(row) : SelectOther;
-        Require(Evaluate(&user, row) == BitField(word, offset, count, opcode == IrOpcode::BitFieldSExtract));
+        Require(Evaluate(used, row) == BitField(word, offset, count, opcode == IrOpcode::BitFieldSExtract));
     }
 }
 static void MergedRefused(IrOpcode opcode, std::uint32_t offset, std::uint32_t count, bool loop) {
@@ -443,6 +457,18 @@ static bool BuiltinRemains(const IrProgram& program, StageInputKind kind) {
 static bool AncillaryRemains(const IrProgram& program) {
     return BuiltinRemains(program, StageInputKind::PackedAncillary);
 }
+static void PerPixelSampleNumber(bool throughSelect) {
+    IrProgram program;
+    static_cast<void>(Build(program, IrOpcode::BitFieldUExtract, 8u, 4u, throughSelect));
+    Lower(program);
+    Require(!BuiltinRemains(program, StageInputKind::SampleId));
+    const IrValue* used = Referenced(program);
+    Require(throughSelect || (used->HasImmediate() && used->ImmediateU32() == 0u));
+    for (const Row& row : Rows) {
+        const std::uint32_t word = throughSelect && !row.frontFacing ? SelectOther : PackedWord(row);
+        Require(Evaluate(used, row) == BitField(word, 8u, 4u, false));
+    }
+}
 static void ExportedWholeWord() {
     IrProgram program;
     auto& entry = Begin(program);
@@ -476,12 +502,12 @@ static void ExportedWholeWord() {
     static_cast<void>(builder.Emit(IrOpcode::Return, IrType::Void, {}));
     LowerMasked(program, true);
     Require(!AncillaryRemains(program) && program.Info().rasterPrimitive);
-    Require(BuiltinRemains(program, StageInputKind::LayerExported));
+    Require(BuiltinRemains(program, StageInputKind::LayerExported) && BuiltinRemains(program, StageInputKind::SampleId) == Iterated);
     const IrValue* word = carried.Argument(0)->Resolve();
     constexpr std::array<Row, 7> words {{{0u, 0u, false, RasterPrimitive::Triangle}, {0u, 0u, false, RasterPrimitive::Rectangle}, {0u, 0u, false, RasterPrimitive::Line}, {15u, 0x1FFFu, false, RasterPrimitive::Point}, {3u, 0x7FFu, false, RasterPrimitive::Triangle},
         {15u, 0x7FFu, false, RasterPrimitive::Point, true}, {3u, 5u, false, RasterPrimitive::Triangle, true}}};
     for (const Row& row : words) {
-        Require(Evaluate(word, row) == (static_cast<std::uint32_t>(row.primitive) | (row.sample << 8u) | (row.layerExported ? row.layer << 16u : 0u)));
+        Require(Evaluate(word, row) == (static_cast<std::uint32_t>(row.primitive) | ((Iterated ? row.sample : 0u) << 8u) | (row.layerExported ? row.layer << 16u : 0u)));
     }
 }
 static void WholeWordReplacesRefusal(HelperRead read) {
@@ -533,12 +559,7 @@ static const IrValue* StartingQuadExported(IrProgram& program, StartingQuad shap
     } else {
         Lower(program);
     }
-    for (const IrBlock* block : program.BlockOrder()) {
-        for (const IrValue* inst : block->Instructions()) {
-            if (inst->Opcode() == IrOpcode::ReferenceU32) return inst->Argument(0)->Resolve();
-        }
-    }
-    return nullptr;
+    return Referenced(program);
 }
 static void StartingQuadOnly() {
     IrProgram program;
@@ -618,4 +639,12 @@ int main() {
     StartingQuadRefused(StartingQuad::BallotAfterBranch);
     StartingQuadRefused(StartingQuad::BallotOfOtherLanes);
     StartingQuadOutsidePixel();
+    Iterated = false;
+    PerPixelSampleNumber(false);
+    PerPixelSampleNumber(true);
+    Values(IrOpcode::BitFieldUExtract, 8u, 4u, false);
+    Values(IrOpcode::BitFieldUExtract, 16u, 13u, false);
+    MergedValues(IrOpcode::BitFieldUExtract, 8u, 4u, false);
+    ExtractVector(16u, 11u, StageInputKind::Layer, 0u);
+    ExportedWholeWord();
 }

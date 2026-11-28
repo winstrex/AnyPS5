@@ -4,11 +4,51 @@
 #include <cmath>
 #include <utility>
 
+namespace {
+
+bool slew(double& value, double target, double travel) {
+    const double before = value;
+    value = target > before ? std::min(target, before + travel) : std::max(target, before - travel);
+    return value != before;
+}
+
+std::uint8_t triggerByte(double value) {
+    return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0));
+}
+
+}
+
 Pad::MouseStick::MouseStick(const InputSettings& settings) : settings(settings) {}
 
 void Pad::MouseStick::Move(int deltaX, int deltaY) {
     pendingX += deltaX;
     pendingY += deltaY;
+    pendingCounts += std::hypot(deltaX, deltaY);
+    ++pendingReports;
+}
+
+void Pad::MouseStick::measureReportRate(double step, bool moved) {
+    if (moved) {
+        rateSeconds += std::min(idleSeconds + step, MouseRateGapSeconds);
+        rateCounts += pendingCounts;
+        rateReports += pendingReports;
+    }
+    pendingCounts = 0.0;
+    pendingReports = 0;
+    if (rateSeconds < MouseRateWindowSeconds) return;
+    if (rateReports >= 10 && rateCounts >= 2.0 * rateReports) reportRate = rateReports / rateSeconds;
+    rateSeconds = 0.0;
+    rateCounts = 0.0;
+    rateReports = 0;
+}
+
+double Pad::MouseStick::ReportRate() const {
+    return reportRate;
+}
+
+double Pad::MouseStick::SmoothingMs() const {
+    const double reports = reportRate > 0.0 ? std::min(MouseSmoothingReports * 1000.0 / reportRate, MouseSmoothingLimitMs) : 0.0;
+    return settings.mouseSmoothingMs > 0.0 ? std::max(settings.mouseSmoothingMs, reports) : 0.0;
 }
 
 void Pad::MouseStick::Advance(double seconds) {
@@ -23,13 +63,15 @@ void Pad::MouseStick::Advance(double seconds) {
     const double targetY = pendingY * scale * settings.mouseVerticalScale;
     pendingX = 0.0;
     pendingY = 0.0;
+    measureReportRate(step, moved);
     idleSeconds = moved ? 0.0 : idleSeconds + step;
     if (idleSeconds * 1000.0 >= settings.mouseDecayMs) {
         speedX = 0.0;
         speedY = 0.0;
         return;
     }
-    const double keep = settings.mouseSmoothingMs > 0.0 ? std::exp(-step * 1000.0 / settings.mouseSmoothingMs) : 0.0;
+    const double smoothing = SmoothingMs();
+    const double keep = smoothing > 0.0 ? std::exp(-step * 1000.0 / smoothing) : 0.0;
     speedX = targetX + (speedX - targetX) * keep;
     speedY = targetY + (speedY - targetY) * keep;
     const double speed = std::hypot(speedX, speedY);
@@ -43,6 +85,11 @@ void Pad::MouseStick::Reset() {
     pendingX = 0.0;
     pendingY = 0.0;
     pendingSeconds = 0.0;
+    pendingCounts = 0.0;
+    pendingReports = 0;
+    rateSeconds = 0.0;
+    rateCounts = 0.0;
+    rateReports = 0;
     speedX = 0.0;
     speedY = 0.0;
     idleSeconds = 0.0;
@@ -75,8 +122,135 @@ const Pad::InputConfiguration& Pad::KeyboardMouse::Configuration() const {
     return configuration;
 }
 
+void Pad::KeyboardMouse::Replace(InputConfiguration next) {
+    Release();
+    configuration = std::move(next);
+    pressed.assign(configuration.bindings.size(), false);
+    wheelReleaseTimes.assign(configuration.bindings.size(), Clock::time_point{});
+    mouse = MouseStick(configuration.settings);
+}
+
 bool Pad::KeyboardMouse::MouseMode() const {
     return mouseMode;
+}
+
+const char* Pad::KeyboardMouse::MouseModeShortcut(bool guestReadsMouse) const {
+    MouseButton button = MouseButton::None;
+    for (const auto& binding : configuration.bindings) {
+        if (binding.control != InputControl::ToggleMouse) continue;
+        switch (binding.key) {
+            case SDL_SCANCODE_UNKNOWN: break;
+            case SDL_SCANCODE_BACKSLASH: return "Backslash";
+            case SDL_SCANCODE_NONUSBACKSLASH: return "Non-US backslash";
+            case SDL_SCANCODE_LEFTBRACKET: return "Left bracket";
+            case SDL_SCANCODE_RIGHTBRACKET: return "Right bracket";
+            case SDL_SCANCODE_NONUSHASH: return "Non-US hash";
+            case SDL_SCANCODE_SEMICOLON: return "Semicolon";
+            case SDL_SCANCODE_APOSTROPHE: return "Apostrophe";
+            case SDL_SCANCODE_GRAVE: return "Grave accent";
+            case SDL_SCANCODE_COMMA: return "Comma";
+            case SDL_SCANCODE_EQUALS: return "Equals";
+            case SDL_SCANCODE_KP_MULTIPLY: return "Keypad multiply";
+            case SDL_SCANCODE_KP_EQUALS: return "Keypad equals";
+            case SDL_SCANCODE_KP_COMMA: return "Keypad comma";
+            case SDL_SCANCODE_KP_EQUALSAS400: return "Keypad equals AS400";
+            case SDL_SCANCODE_KP_LEFTPAREN: return "Keypad left parenthesis";
+            case SDL_SCANCODE_KP_RIGHTPAREN: return "Keypad right parenthesis";
+            case SDL_SCANCODE_KP_LEFTBRACE: return "Keypad left brace";
+            case SDL_SCANCODE_KP_RIGHTBRACE: return "Keypad right brace";
+            case SDL_SCANCODE_KP_POWER: return "Keypad power";
+            case SDL_SCANCODE_KP_LESS: return "Keypad less than";
+            case SDL_SCANCODE_KP_GREATER: return "Keypad greater than";
+            case SDL_SCANCODE_KP_AMPERSAND: return "Keypad ampersand";
+            case SDL_SCANCODE_KP_DBLAMPERSAND: return "Keypad double ampersand";
+            case SDL_SCANCODE_KP_VERTICALBAR: return "Keypad vertical bar";
+            case SDL_SCANCODE_KP_DBLVERTICALBAR: return "Keypad double bar";
+            case SDL_SCANCODE_KP_HASH: return "Keypad hash";
+            case SDL_SCANCODE_KP_AT: return "Keypad at";
+            case SDL_SCANCODE_KP_EXCLAM: return "Keypad exclamation";
+            default: return SDL_GetScancodeName(binding.key);
+        }
+        if (button == MouseButton::None) button = binding.mouseButton;
+    }
+    if (guestReadsMouse && !mouseMode) return "";
+    switch (button) {
+        case MouseButton::Left: return "Left click";
+        case MouseButton::Middle: return "Middle click";
+        case MouseButton::Right: return "Right click";
+        case MouseButton::X1: return "Mouse X1";
+        case MouseButton::X2: return "Mouse X2";
+        case MouseButton::None: return "";
+    }
+    return "";
+}
+
+Pad::KeyboardMouse::StickInput Pad::KeyboardMouse::stickInput() const {
+    std::array<bool, 4> negative{};
+    std::array<bool, 4> positive{};
+    bool modifier = false;
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        if (!pressed[index]) continue;
+        switch (configuration.bindings[index].control) {
+            case InputControl::LeftStickLeft: negative[0] = true; break;
+            case InputControl::LeftStickRight: positive[0] = true; break;
+            case InputControl::LeftStickUp: negative[1] = true; break;
+            case InputControl::LeftStickDown: positive[1] = true; break;
+            case InputControl::RightStickLeft: negative[2] = true; break;
+            case InputControl::RightStickRight: positive[2] = true; break;
+            case InputControl::RightStickUp: negative[3] = true; break;
+            case InputControl::RightStickDown: positive[3] = true; break;
+            case InputControl::StickModifier: modifier = true; break;
+            default: break;
+        }
+    }
+    const double scale = modifier ? configuration.settings.stickModifierScale : 1.0;
+    StickInput input;
+    for (std::size_t axis = 0; axis < input.targets.size(); ++axis) {
+        input.targets[axis] = (static_cast<double>(positive[axis]) - static_cast<double>(negative[axis])) * scale;
+        input.held[axis] = negative[axis] || positive[axis];
+    }
+    return input;
+}
+
+bool Pad::KeyboardMouse::isToggleBinding(const InputBinding& binding) const {
+    const bool keyOrMouse = binding.key != SDL_SCANCODE_UNKNOWN || binding.mouseButton != MouseButton::None;
+    return keyOrMouse && binding.control == InputControl::Button && (configuration.toggleButtons & static_cast<std::uint32_t>(binding.button)) != 0;
+}
+
+bool Pad::KeyboardMouse::bindingHeld(std::size_t index) const {
+    const auto& binding = configuration.bindings[index];
+    if (isToggleBinding(binding)) return toggles.Held(static_cast<std::uint32_t>(binding.button));
+    return pressed[index];
+}
+
+std::array<double, 2> Pad::KeyboardMouse::triggerTargets() const {
+    std::array<double, 2> targets{};
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        const auto& binding = configuration.bindings[index];
+        if (binding.control != InputControl::Button || !bindingHeld(index)) continue;
+        if (binding.button == PadButton::L2) targets[0] = 1.0;
+        if (binding.button == PadButton::R2) targets[1] = 1.0;
+    }
+    return targets;
+}
+
+bool Pad::KeyboardMouse::advanceAxes(Clock::time_point now) {
+    const double seconds = axesAdvanced && now > lastAxisAdvance ? std::chrono::duration<double>(now - lastAxisAdvance).count() : 0.0;
+    if (!axesAdvanced || now > lastAxisAdvance) lastAxisAdvance = now;
+    axesAdvanced = true;
+    if (seconds <= 0.0) return false;
+    bool moved = false;
+    if (configuration.settings.keyboardRampMs > 0.0) {
+        const auto targets = stickInput().targets;
+        const double travel = seconds * 1000.0 / configuration.settings.keyboardRampMs;
+        for (std::size_t axis = 0; axis < stickAxes.size(); ++axis) moved = slew(stickAxes[axis], targets[axis], travel) || moved;
+    }
+    if (configuration.settings.triggerRampMs > 0.0) {
+        const auto targets = triggerTargets();
+        const double travel = seconds * 1000.0 / configuration.settings.triggerRampMs;
+        for (std::size_t trigger = 0; trigger < triggerAxes.size(); ++trigger) moved = slew(triggerAxes[trigger], targets[trigger], travel) || moved;
+    }
+    return moved;
 }
 
 bool Pad::KeyboardMouse::Advance(Clock::time_point now) {
@@ -88,25 +262,75 @@ bool Pad::KeyboardMouse::Advance(Clock::time_point now) {
         const double seconds = std::chrono::duration<double>(now - lastAdvance).count();
         lastAdvance = now;
         if (mouseMode) mouse.Advance(seconds);
+        gyroRate = mouseGyro && mouseMode && seconds > 0.0 ? std::array<double, 2>{gyroCountsX / seconds, gyroCountsY / seconds} : std::array<double, 2>{};
+        gyroCountsX = 0.0;
+        gyroCountsY = 0.0;
     }
-    bool released = false;
+    bool changed = advanceAxes(now);
+    if (gyroRate[0] != 0.0 || gyroRate[1] != 0.0) changed = true;
     for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
-        if (configuration.bindings[index].wheelDirection == 0 || !pressed[index] || now < wheelReleaseTimes[index]) continue;
+        const auto& binding = configuration.bindings[index];
+        if (pressed[index] && binding.control == InputControl::Shake) changed = true;
+        if ((binding.wheelDirection == 0 && binding.wheelTilt == 0) || !pressed[index] || now < wheelReleaseTimes[index]) continue;
         pressed[index] = false;
         wheelReleaseTimes[index] = {};
-        released = true;
+        changed = true;
     }
-    return released;
+    return changed;
 }
 
 void Pad::KeyboardMouse::SetMouseMode(bool enabled) {
+    if (enabled) mouseTouch.reset();
+    if (mouseMode && !enabled && titleReadsMouse) {
+        for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+            const auto& binding = configuration.bindings[index];
+            if (binding.mouseButton == MouseButton::None && binding.wheelDirection == 0 && binding.wheelTilt == 0) continue;
+            pressed[index] = false;
+            wheelReleaseTimes[index] = {};
+        }
+    }
     mouseMode = enabled;
     mouse.Reset();
 }
 
+void Pad::KeyboardMouse::SetTitleReadsMouse(bool reads) {
+    titleReadsMouse = reads;
+}
+
 void Pad::KeyboardMouse::Release() {
     std::fill(pressed.begin(), pressed.end(), false);
+    toggles.Clear();
     std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), Clock::time_point{});
+    stickAxes = {};
+    triggerAxes = {};
+}
+
+void Pad::KeyboardMouse::SetMouseTouchpad(bool enabled) {
+    mouseTouchpad = enabled;
+    if (!enabled) mouseTouch.reset();
+}
+
+void Pad::KeyboardMouse::SetMouseGyro(bool enabled) {
+    mouseGyro = enabled;
+    if (!enabled) {
+        gyroCountsX = 0.0;
+        gyroCountsY = 0.0;
+        gyroRate = {};
+    }
+}
+
+void Pad::KeyboardMouse::SetViewport(int width, int height) {
+    viewportWidth = width;
+    viewportHeight = height;
+}
+
+std::optional<PadTouchPoint> Pad::KeyboardMouse::touchAt(int x, int y) const {
+    if (viewportWidth <= 0 || viewportHeight <= 0) return std::nullopt;
+    const auto clampedX = std::clamp(x, 0, viewportWidth - 1);
+    const auto clampedY = std::clamp(y, 0, viewportHeight - 1);
+    const auto padX = std::min<std::int64_t>(static_cast<std::int64_t>(clampedX) * kTouchPadWidth / viewportWidth, kTouchPadWidth - 1);
+    const auto padY = std::min<std::int64_t>(static_cast<std::int64_t>(clampedY) * kTouchPadHeight / viewportHeight, kTouchPadHeight - 1);
+    return PadTouchPoint{true, static_cast<std::uint16_t>(padX), static_cast<std::uint16_t>(padY), 0};
 }
 
 Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock::time_point now) {
@@ -114,22 +338,35 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
     if (event.type == SDL_WINDOWEVENT) {
         if (event.window.event != SDL_WINDOWEVENT_FOCUS_LOST && event.window.event != SDL_WINDOWEVENT_CLOSE) return requests;
         Release();
+        mouseTouch.reset();
         requests.releaseMouse = mouseMode;
         return requests;
     }
     if (event.type == SDL_MOUSEMOTION) {
+        if (mouseTouch) mouseTouch = touchAt(event.motion.x, event.motion.y);
+        if (mouseGyro && mouseMode) {
+            gyroCountsX += event.motion.xrel;
+            gyroCountsY += event.motion.yrel;
+        }
         if (mouseMode) mouse.Move(event.motion.xrel, event.motion.yrel);
         return requests;
     }
     if (event.type == SDL_MOUSEWHEEL) {
+        if (titleReadsMouse && !mouseMode) return requests;
         int direction = (event.wheel.y > 0) - (event.wheel.y < 0);
-        if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) direction = -direction;
-        if (direction == 0) return requests;
+        int tilt = (event.wheel.x > 0) - (event.wheel.x < 0);
+        if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
+            direction = -direction;
+            tilt = -tilt;
+        }
+        if (direction == 0 && tilt == 0) return requests;
+        advanceAxes(now);
         const auto releaseTime = now + std::chrono::milliseconds(WheelPressDurationMs);
         for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
             const auto& binding = configuration.bindings[index];
-            if (binding.wheelDirection == 0) continue;
-            pressed[index] = binding.wheelDirection == direction;
+            if (binding.wheelDirection != 0 && direction != 0) pressed[index] = binding.wheelDirection == direction;
+            else if (binding.wheelTilt != 0 && tilt != 0) pressed[index] = binding.wheelTilt == tilt;
+            else continue;
             wheelReleaseTimes[index] = pressed[index] ? releaseTime : Clock::time_point{};
         }
         return requests;
@@ -138,6 +375,10 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
     const bool mouseButton = event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP;
     if (!keyboard && !mouseButton) return requests;
     if (keyboard && event.key.repeat != 0) return requests;
+    if (event.type == SDL_MOUSEBUTTONDOWN && titleReadsMouse && !mouseMode) return requests;
+    if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) mouseTouch.reset();
+    if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT && mouseTouchpad && !mouseMode) mouseTouch = touchAt(event.button.x, event.button.y);
+    advanceAxes(now);
     const bool down = event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN;
     for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
         const auto& binding = configuration.bindings[index];
@@ -145,47 +386,108 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
             ? binding.key != SDL_SCANCODE_UNKNOWN && binding.key == event.key.keysym.scancode
             : binding.mouseButton != MouseButton::None && binding.mouseButton == static_cast<MouseButton>(event.button.button);
         if (!matches) continue;
+        if (down && !pressed[index] && isToggleBinding(binding)) toggles.Toggle(static_cast<std::uint32_t>(binding.button));
         if (binding.control == InputControl::ToggleFullscreen && keyboard && down && !pressed[index]) requests.toggleFullscreen = true;
+        if (binding.control == InputControl::ToggleBorderless && keyboard && down && !pressed[index]) requests.toggleBorderless = true;
+        if (binding.control == InputControl::TogglePerformanceOverlay && keyboard && down && !pressed[index]) requests.togglePerformanceOverlay = true;
+        if (binding.control == InputControl::Screenshot && keyboard && down && !pressed[index]) requests.screenshot = true;
+        if (binding.control == InputControl::ShowPadStatus && keyboard && down && !pressed[index]) requests.showPadStatus = true;
+        if (binding.control == InputControl::VolumeUp && keyboard && down && !pressed[index]) requests.volumeUp = true;
+        if (binding.control == InputControl::VolumeDown && keyboard && down && !pressed[index]) requests.volumeDown = true;
+        if (binding.control == InputControl::ToggleMute && keyboard && down && !pressed[index]) requests.toggleMute = true;
         if (binding.control == InputControl::ToggleMouse && down && !pressed[index]) requests.toggleMouse = true;
+        if (binding.control == InputControl::ReloadInputMapping && keyboard && down && !pressed[index]) requests.reloadInputMapping = true;
         pressed[index] = down;
+    }
+    return requests;
+}
+
+Pad::InputRequests Pad::KeyboardMouse::PadChordRequests(std::uint32_t buttons) {
+    InputRequests requests;
+    const auto previous = padButtons;
+    padButtons = buttons;
+    for (const auto& binding : configuration.bindings) {
+        if (binding.padButtons == 0) continue;
+        const bool wasHeld = (previous & binding.padButtons) == binding.padButtons;
+        const bool held = (buttons & binding.padButtons) == binding.padButtons;
+        if (!held || wasHeld) continue;
+        if (binding.control == InputControl::ToggleFullscreen) requests.toggleFullscreen = true;
+        if (binding.control == InputControl::TogglePerformanceOverlay) requests.togglePerformanceOverlay = true;
+        if (binding.control == InputControl::Screenshot) requests.screenshot = true;
+        if (binding.control == InputControl::ShowPadStatus) requests.showPadStatus = true;
+        if (binding.control == InputControl::VolumeUp) requests.volumeUp = true;
+        if (binding.control == InputControl::VolumeDown) requests.volumeDown = true;
+        if (binding.control == InputControl::ToggleMute) requests.toggleMute = true;
+        if (binding.control == InputControl::ReloadInputMapping) requests.reloadInputMapping = true;
     }
     return requests;
 }
 
 PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const {
     PadInputState state = controller;
-    std::array<bool, 4> negative{};
-    std::array<bool, 4> positive{};
     for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
-        if (!pressed[index]) continue;
+        if (!bindingHeld(index)) continue;
         const auto& binding = configuration.bindings[index];
         switch (binding.control) {
             case InputControl::Button:
+                if (configuration.settings.triggerRampMs > 0.0 && (binding.button == PadButton::L2 || binding.button == PadButton::R2)) break;
                 state.buttons |= static_cast<std::uint32_t>(binding.button);
                 if (binding.button == PadButton::L2) state.analogButtonsL2 = 255;
                 if (binding.button == PadButton::R2) state.analogButtonsR2 = 255;
                 break;
-            case InputControl::LeftStickLeft: negative[0] = true; break;
-            case InputControl::LeftStickRight: positive[0] = true; break;
-            case InputControl::LeftStickUp: negative[1] = true; break;
-            case InputControl::LeftStickDown: positive[1] = true; break;
-            case InputControl::RightStickLeft: negative[2] = true; break;
-            case InputControl::RightStickRight: positive[2] = true; break;
-            case InputControl::RightStickUp: negative[3] = true; break;
-            case InputControl::RightStickDown: positive[3] = true; break;
             case InputControl::TouchLeft: state.touchLeft = true; break;
             case InputControl::TouchRight: state.touchRight = true; break;
+            case InputControl::LeftStickLeft:
+            case InputControl::LeftStickRight:
+            case InputControl::LeftStickUp:
+            case InputControl::LeftStickDown:
+            case InputControl::RightStickLeft:
+            case InputControl::RightStickRight:
+            case InputControl::RightStickUp:
+            case InputControl::RightStickDown:
+            case InputControl::StickModifier: break;
+            case InputControl::Shake: {
+                const float sign = (lastAdvance.time_since_epoch() / ShakeHalfPeriod) % 2 == 0 ? 1.0f : -1.0f;
+                state.hasMotion = true;
+                state.accel = {sign * ShakeAcceleration, 9.80665f, 0.0f};
+                state.gyro = {0.0f, 0.0f, sign * ShakeAngularVelocity};
+                break;
+            }
             case InputControl::ToggleMouse: break;
             case InputControl::ToggleFullscreen: break;
+            case InputControl::ToggleBorderless: break;
+            case InputControl::TogglePerformanceOverlay: break;
+            case InputControl::Screenshot: break;
+            case InputControl::ShowPadStatus: break;
+            case InputControl::VolumeUp: break;
+            case InputControl::VolumeDown: break;
+            case InputControl::ToggleMute: break;
+            case InputControl::ReloadInputMapping: break;
         }
     }
+    const auto input = stickInput();
+    const auto& axes = configuration.settings.keyboardRampMs > 0.0 ? stickAxes : input.targets;
     for (std::size_t axis = 0; axis < state.sticks.size(); ++axis) {
-        if (negative[axis] || positive[axis]) state.sticks[axis] = negative[axis] == positive[axis] ? 128 : negative[axis] ? 0 : 255;
+        if (input.held[axis] || axes[axis] != 0.0) state.sticks[axis] = StickByte(axes[axis]);
     }
-    if (mouseMode) {
-        const auto deflection = mouse.Deflection();
-        state.sticks[2] = StickByte(deflection[0]);
-        state.sticks[3] = StickByte(deflection[1]);
+    const auto deflection = mouse.Deflection();
+    if (mouseMode && (deflection[0] != 0.0 || deflection[1] != 0.0)) {
+        const std::size_t offset = configuration.settings.mouseControlsRightStick ? 2 : 0;
+        state.sticks[offset] = StickByte(deflection[0]);
+        state.sticks[offset + 1] = StickByte(deflection[1]);
+    }
+    if (configuration.settings.triggerRampMs > 0.0) {
+        state.analogButtonsL2 = std::max(state.analogButtonsL2, triggerByte(triggerAxes[0]));
+        state.analogButtonsR2 = std::max(state.analogButtonsR2, triggerByte(triggerAxes[1]));
+    }
+    if (mouseGyro && mouseMode && (gyroRate[0] != 0.0 || gyroRate[1] != 0.0)) {
+        state.hasMotion = true;
+        state.gyro[1] += static_cast<float>(gyroRate[1] * MouseGyroRadiansPerCount);
+        state.gyro[2] += static_cast<float>(gyroRate[0] * MouseGyroRadiansPerCount);
+    }
+    if (mouseTouch) {
+        if (!state.touch[0].active) state.touch[0] = *mouseTouch;
+        else if (!state.touch[1].active) state.touch[1] = *mouseTouch;
     }
     if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(PadButton::L2);
     if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(PadButton::R2);

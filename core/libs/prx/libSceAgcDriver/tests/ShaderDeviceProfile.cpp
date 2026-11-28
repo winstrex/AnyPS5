@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderDeviceProfile.hpp"
 #include "BdaAbi.hpp"
+#include "CacheKey.hpp"
 #include "Optimization/BindingAllocator.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -16,8 +18,8 @@ using AgcDriver::Graphics::Require;
 
 struct ProfileInput {
     std::vector<std::uint32_t> capabilities{spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
-    std::array<std::string, 2> extensionStrings{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
-    std::array<std::string_view, 2> extensions{extensionStrings[0], extensionStrings[1]};
+    std::vector<std::string> extensionStrings{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    std::vector<std::string_view> extensions{extensionStrings[0], extensionStrings[1]};
     VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, nullptr, VK_FALSE, VK_FALSE, VK_TRUE};
     VkPhysicalDeviceDescriptorIndexingFeatures indexing{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, &robustness};
     VkPhysicalDevice8BitStorageFeatures bytes{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, &indexing, VK_TRUE};
@@ -54,7 +56,7 @@ void Reject(TAction action, const char* expected) {
         Require(std::string(error.what()).find(expected) != std::string::npos, "unexpected profile validation error");
         return;
     }
-    throw std::runtime_error("invalid shader device profile was accepted");
+    throw std::runtime_error(std::string("invalid shader device profile was accepted: ") + expected);
 }
 
 void CheckProfile() {
@@ -80,6 +82,7 @@ void CheckProfile() {
     invalid([](auto& value) { value.bda.bufferDeviceAddress = VK_FALSE; }, "bufferDeviceAddress");
     invalid([](auto& value) { value.device.pNext = nullptr; }, "bufferDeviceAddress");
     invalid([](auto& value) { value.core.shaderInt64 = VK_FALSE; }, "shaderInt64");
+    invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityGeometry); }, "geometryShader");
     invalid([](auto& value) { value.bytes.storageBuffer8BitAccess = VK_FALSE; }, "storageBuffer8BitAccess");
     ProfileInput withoutNull;
     withoutNull.robustness.nullDescriptor = VK_FALSE;
@@ -99,6 +102,8 @@ void CheckProfile() {
     invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityStorageImageMultisample); }, "shaderStorageImageMultisample");
     invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityFragmentBarycentricKHR); }, "fragmentShaderBarycentric");
     invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityMeshShadingEXT); }, "meshShader");
+    invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityDrawParameters); }, "shaderDrawParameters");
+    invalid([](auto& value) { value.extensions.push_back("SPV_KHR_terminate_invocation"); }, "shaderTerminateInvocation");
     ProfileInput enabled;
     enabled.capabilities.push_back(spv::CapabilitySampledImageArrayDynamicIndexing);
     enabled.capabilities.push_back(spv::CapabilityStorageImageArrayNonUniformIndexing);
@@ -106,6 +111,82 @@ void CheckProfile() {
     enabled.indexing.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
     const AgcDriver::ShaderDeviceProfile accepted(enabled.Target(), enabled.device, enabled.limits);
     Require(accepted.Target().supportedCapabilities.size() == 6u, "enabled descriptor indexing was rejected");
+    ProfileInput drawParameters;
+    drawParameters.capabilities.push_back(spv::CapabilityDrawParameters);
+    VkPhysicalDeviceShaderDrawParametersFeatures drawFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES, &drawParameters.bda, VK_TRUE};
+    drawParameters.device.pNext = &drawFeatures;
+    const AgcDriver::ShaderDeviceProfile drawParametersAccepted(drawParameters.Target(), drawParameters.device, drawParameters.limits);
+    Require(std::ranges::find(drawParametersAccepted.Target().supportedCapabilities, spv::CapabilityDrawParameters) != drawParametersAccepted.Target().supportedCapabilities.end(), "enabled shaderDrawParameters was rejected");
+    ProfileInput terminating;
+    VkPhysicalDeviceShaderTerminateInvocationFeaturesKHR terminate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES_KHR, &terminating.bda, VK_TRUE};
+    terminating.device.pNext = &terminate;
+    terminating.extensions.push_back("SPV_KHR_terminate_invocation");
+    const AgcDriver::ShaderDeviceProfile terminated(terminating.Target(), terminating.device, terminating.limits);
+    Require(std::ranges::find(terminated.Target().supportedExtensions, "SPV_KHR_terminate_invocation") != terminated.Target().supportedExtensions.end(), "enabled shaderTerminateInvocation was rejected");
+    ProfileInput disabled;
+    VkPhysicalDeviceShaderTerminateInvocationFeaturesKHR disabledTerminate{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_TERMINATE_INVOCATION_FEATURES_KHR, &disabled.bda, VK_FALSE};
+    disabled.device.pNext = &disabledTerminate;
+    disabled.extensions.push_back("SPV_KHR_terminate_invocation");
+    Reject([&] { AgcDriver::ShaderDeviceProfile rejected(disabled.Target(), disabled.device, disabled.limits); }, "shaderTerminateInvocation");
+    ProfileInput geometryEnabled;
+    geometryEnabled.capabilities.push_back(spv::CapabilityGeometry);
+    geometryEnabled.core.geometryShader = VK_TRUE;
+    const AgcDriver::ShaderDeviceProfile geometryAccepted(geometryEnabled.Target(), geometryEnabled.device, geometryEnabled.limits);
+    Require(std::ranges::find(geometryAccepted.Target().supportedCapabilities, spv::CapabilityGeometry) != geometryAccepted.Target().supportedCapabilities.end(), "enabled geometry shaders were rejected");
+}
+
+std::vector<std::uint64_t> CacheKeyFor(const ShaderRecompiler::SpirvTarget& target) {
+    static constexpr std::array<std::uint32_t, 1> code{0xbf810000u};
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Compute, 0x10000u, code, 0, {}};
+    request.context.waveSize = 64;
+    request.target = target;
+    std::vector<std::uint64_t> key;
+    ShaderRecompiler::RecompileCacheKey::Build(request, key);
+    return key;
+}
+
+std::vector<std::uint64_t> PerKeyDigestKeyFor(ShaderRecompiler::SpirvTarget target) {
+    target.featureDigestSealed = false;
+    return CacheKeyFor(target);
+}
+
+void CheckFeatureDigest() {
+    ProfileInput input;
+    const AgcDriver::ShaderDeviceProfile profile(input.Target(), input.device, input.limits);
+    const auto sealed = profile.Target();
+    Require(sealed.featureDigestSealed, "the shader device profile did not seal its feature digest");
+    const auto key = CacheKeyFor(sealed);
+    Require(key == PerKeyDigestKeyFor(sealed), "the sealed feature digest differs from the per-key digest");
+    const std::vector<std::uint32_t> capabilityCopy(sealed.supportedCapabilities.begin(), sealed.supportedCapabilities.end());
+    const std::vector<std::string> extensionStorage(sealed.supportedExtensions.begin(), sealed.supportedExtensions.end());
+    const std::vector<std::string_view> extensionCopy(extensionStorage.begin(), extensionStorage.end());
+    auto copied = sealed;
+    copied.supportedCapabilities = capabilityCopy;
+    copied.supportedExtensions = extensionCopy;
+    Require(CacheKeyFor(copied) == key, "equal feature lists in other storage gave another key than the sealed digest");
+    auto fewerCapabilities = sealed;
+    fewerCapabilities.supportedCapabilities = sealed.supportedCapabilities.first(sealed.supportedCapabilities.size() - 1u);
+    Require(CacheKeyFor(fewerCapabilities) != key && CacheKeyFor(fewerCapabilities) == PerKeyDigestKeyFor(fewerCapabilities), "a sealed digest outlived the capability list it was computed from");
+    auto fewerExtensions = sealed;
+    fewerExtensions.supportedExtensions = sealed.supportedExtensions.first(1u);
+    Require(CacheKeyFor(fewerExtensions) != key && CacheKeyFor(fewerExtensions) == PerKeyDigestKeyFor(fewerExtensions), "a sealed digest outlived the extension list it was computed from");
+    ProfileInput reordered;
+    std::ranges::reverse(reordered.capabilities);
+    std::ranges::reverse(reordered.extensions);
+    const AgcDriver::ShaderDeviceProfile reorderedProfile(reordered.Target(), reordered.device, reordered.limits);
+    Require(CacheKeyFor(reorderedProfile.Target()) == key, "two profiles with the same features gave different keys");
+    ProfileInput geometry;
+    geometry.capabilities.push_back(spv::CapabilityGeometry);
+    geometry.core.geometryShader = VK_TRUE;
+    const AgcDriver::ShaderDeviceProfile geometryProfile(geometry.Target(), geometry.device, geometry.limits);
+    const auto geometryKey = CacheKeyFor(geometryProfile.Target());
+    Require(geometryKey != key && geometryKey == PerKeyDigestKeyFor(geometryProfile.Target()), "a profile capability did not change the feature digest");
+    ProfileInput indexing;
+    indexing.extensions.push_back("SPV_EXT_descriptor_indexing");
+    const AgcDriver::ShaderDeviceProfile indexingProfile(indexing.Target(), indexing.device, indexing.limits);
+    const auto indexingKey = CacheKeyFor(indexingProfile.Target());
+    Require(indexingKey != key && indexingKey != geometryKey && indexingKey == PerKeyDigestKeyFor(indexingProfile.Target()), "a profile extension did not change the feature digest");
 }
 
 void CheckAbi() {
@@ -120,6 +201,13 @@ void CheckAbi() {
     }
     Require(BindingNumber(Stage::Main, Binding::ShaderData) == 62u && BindingNumber(Stage::Fragment, Binding::ShaderData) == 127u, "runtime ABI binding numbers changed");
     Require(BindingNumber(Stage::Main, Binding::ImageTable) == ShaderRecompiler::RuntimeAbi::ImageTableBinding && BindingNumber(Stage::TessellationEvaluation, Binding::ImageTable) == ShaderRecompiler::RuntimeAbi::ImageTableBinding && !bindings.contains(ShaderRecompiler::RuntimeAbi::ImageTableBinding), "the shared image table binding overlaps a stage binding");
+    for (std::uint32_t stage = 0u; stage < ShaderRecompiler::RuntimeAbi::StageCount; ++stage) {
+        for (std::uint32_t binding = 0u; binding < static_cast<std::uint32_t>(Binding::Count); ++binding) {
+            const bool uint = binding >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 7u && binding < ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + 14u;
+            Require(ShaderRecompiler::RuntimeAbi::UintStorageImageBinding(BindingNumber(static_cast<Stage>(stage), static_cast<Binding>(binding))) == uint, "stage " + std::to_string(stage) + " binding " + std::to_string(binding) + " is not classified by its stage-local uint storage image slot");
+        }
+    }
+    Require(!ShaderRecompiler::RuntimeAbi::UintStorageImageBinding(ShaderRecompiler::RuntimeAbi::ImageStorageTableBinding) && !ShaderRecompiler::RuntimeAbi::UintStorageImageBinding(ShaderRecompiler::RuntimeAbi::ImageTableBinding), "an image table binding is classified as a uint storage image slot");
     Reject([] { BindingNumber(static_cast<Stage>(4u), Binding::Buffers); }, "invalid stage or binding");
     Reject([] { BindingNumber(Stage::Main, Binding::Count); }, "invalid stage or binding");
     Reject([] { ShaderRecompiler::RuntimeAbi::RequireVersion(0u); }, "incompatible version");
@@ -142,6 +230,11 @@ void CheckHeaps() {
     const auto single = allocate(image, 1u);
     const auto sixteenSamplers = allocate(image, 1u, 16u);
     Require(BindingAllocator{}.FindBinding(sixteenSamplers.layout, DescriptorBindingKind::Samplers).resources.size() == 32u, "sixteen logical samplers must fit with both descriptor variants");
+    Require(BindingAllocator{}.FindBinding(allocate(image, 1u, 17u).layout, DescriptorBindingKind::Samplers).resources.size() == 34u, "seventeen logical samplers must fit with both descriptor variants");
+    const auto twentySamplers = allocate(image, 1u, 20u);
+    Require(BindingAllocator{}.FindBinding(twentySamplers.layout, DescriptorBindingKind::Samplers).resources.size() == 40u, "twenty logical samplers must fit with both descriptor variants");
+    const auto thirtyTwoSamplers = allocate(image, 1u, 32u);
+    Require(BindingAllocator{}.FindBinding(thirtyTwoSamplers.layout, DescriptorBindingKind::Samplers).resources.size() == 64u, "thirty-two logical samplers must fit with both descriptor variants");
     const auto full = allocate(image, RuntimeAbi::SampledHeapCapacity, RuntimeAbi::SamplerHeapCapacity / 2u);
     Require(single.layout.ShaderDataDwords() == full.layout.ShaderDataDwords() && single.layout.memoryOffsetDword == full.layout.memoryOffsetDword && !full.layout.UsesPushData(), "runtime layout depends on resource count");
     Require(full.layout.memoryOffsetDword == 0u && full.layout.DispatchThreadLimitDword() == 0u && full.layout.ShaderDataDwords() == 0u, "direct image resources allocated runtime metadata");
@@ -188,6 +281,7 @@ int main() {
         CheckAbi();
         CheckHeaps();
         CheckProfile();
+        CheckFeatureDigest();
         std::cout << "shader runtime ABI and device profile tests passed\n";
         return 0;
     } catch (const std::exception& error) {
