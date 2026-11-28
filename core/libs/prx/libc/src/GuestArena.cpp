@@ -920,6 +920,14 @@ void GuestArenaForgetKnownZero_nid_no_patch(std::uintptr_t address, std::size_t 
     WindowsMappings::Get().ForgetKnownZero(address, bytes);
 }
 
+void GuestArenaMarkKnownZero_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().MarkKnownZero(address, bytes);
+}
+
+void GuestArenaKnownZeroTrustingImports_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
+    WindowsMappings::Get().KnownZero(address, bytes, zero, context, true);
+}
+
 std::uint64_t GuestArenaKnownZeroMarks_nid_no_patch() {
     return WindowsMappings::Get().KnownZeroMarks();
 }

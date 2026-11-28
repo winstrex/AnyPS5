@@ -90,6 +90,73 @@ struct PhysicalMemoryPool {
         return SCE_KERNEL_ERROR_EAGAIN;
     }
 
+    bool FirstFitVisible(int64_t searchStart, int64_t searchEnd, size_t len, size_t alignment, uint64_t& out) {
+        uint64_t align, alignedLen;
+        if (len == 0 || !NormalizeAlignment(alignment, align) || !NormalizeLength(len, alignedLen)) return false;
+        const uint64_t start = static_cast<uint64_t>(searchStart);
+        const uint64_t end = std::min<uint64_t>(static_cast<uint64_t>(searchEnd), kPoolBytes);
+        uint64_t cur;
+        if (start >= end || !RoundUp(start, align, cur)) return false;
+        std::lock_guard<std::mutex> lock(_mutex);
+        const size_t pageCount = static_cast<size_t>(alignedLen / kPage);
+        while (cur <= end && alignedLen <= end - cur) {
+            const size_t first = static_cast<size_t>(cur / kPage);
+            size_t lastUsed = 0;
+            bool used = false;
+            for (size_t i = pageCount; i-- > 0;) {
+                if (_visiblyUsed(first + i)) {
+                    lastUsed = first + i;
+                    used = true;
+                    break;
+                }
+            }
+            if (!used) {
+                out = cur;
+                return true;
+            }
+            if (!RoundUp((static_cast<uint64_t>(lastUsed) + 1) * kPage, align, cur)) break;
+        }
+        return false;
+    }
+
+    void SetHeld(uint64_t start, size_t len, bool held) {
+        uint64_t lo, hi;
+        if (!PageSpan(start, len, lo, hi)) return;
+        std::lock_guard<std::mutex> lock(_mutex);
+        for (uint64_t page = lo / kPage; page < hi / kPage; ++page) _held[page] = held;
+    }
+
+    bool FindVisible(uint64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
+        if (!start || !end || !memoryType || offset >= kPoolBytes) return false;
+        std::lock_guard<std::mutex> lock(_mutex);
+        uint64_t cursor = offset & ~(kPage - 1);
+        for (;;) {
+            BlockMap::const_iterator it = _blocks.upper_bound(cursor);
+            if (it != _blocks.begin() && std::prev(it)->second.end > cursor) --it;
+            else if (!findNext || it == _blocks.end()) return false;
+            const uint64_t blockStart = it->first;
+            const uint64_t blockEnd = it->second.end;
+            uint64_t page = std::max(cursor, blockStart);
+            if (_held[page / kPage]) {
+                if (!findNext) return false;
+                while (page < blockEnd && _held[page / kPage]) page += kPage;
+                if (page >= blockEnd) {
+                    cursor = blockEnd;
+                    if (cursor >= kPoolBytes) return false;
+                    continue;
+                }
+            }
+            uint64_t low = page;
+            while (low > blockStart && !_held[(low - kPage) / kPage]) low -= kPage;
+            uint64_t high = page;
+            while (high < blockEnd && !_held[high / kPage]) high += kPage;
+            *start = static_cast<int64_t>(low);
+            *end = static_cast<int64_t>(high);
+            *memoryType = it->second.type;
+            return true;
+        }
+    }
+
     bool Free(uint64_t start, size_t len) { return _release(start, len, false); }
 
     bool CheckedFree(uint64_t start, size_t len) { return _release(start, len, true); }
@@ -190,12 +257,12 @@ struct PhysicalMemoryPool {
         uint64_t bestSize = 0;
 
         while (cur < limit) {
-            if (_used[cur / kPage]) {
+            if (_visiblyUsed(static_cast<size_t>(cur / kPage))) {
                 cur += kPage;
                 continue;
             }
             uint64_t runEnd = cur;
-            while (runEnd < limit && !_used[runEnd / kPage]) runEnd += kPage;
+            while (runEnd < limit && !_visiblyUsed(static_cast<size_t>(runEnd / kPage))) runEnd += kPage;
 
             const int64_t low = std::max(static_cast<int64_t>(cur), searchStart);
             const int64_t high = std::min(static_cast<int64_t>(runEnd), searchEnd);
@@ -248,6 +315,7 @@ private:
     size_t _nextFreePage(size_t first, size_t limit) const {
         return static_cast<size_t>(std::find(_used + first, _used + limit, false) - _used);
     }
+    bool _visiblyUsed(size_t page) const { return _used[page] && !_held[page]; }
 
     bool _allUsed(size_t first, size_t count) const {
         for (size_t i = 0; i < count; ++i) {
@@ -334,6 +402,7 @@ private:
     std::mutex _mutex;
     std::condition_variable _claimFinished;
     bool _used[kNumPages] = {};
+    bool _held[kNumPages] = {};
     BlockMap _blocks;
 };
 
@@ -345,6 +414,21 @@ int DirectMemoryAlloc(int64_t searchStart, int64_t searchEnd, size_t len, size_t
     } catch (const std::bad_alloc&) {
         return SCE_KERNEL_ERROR_ENOMEM;
     }
+}
+
+bool DirectMemoryFirstFitVisible(int64_t searchStart, int64_t searchEnd, size_t len, size_t alignment, int64_t* out) {
+    uint64_t found = 0;
+    if (!PhysicalMemoryPool::Instance().FirstFitVisible(searchStart, searchEnd, len, alignment, found)) return false;
+    *out = static_cast<int64_t>(found);
+    return true;
+}
+
+void DirectMemorySetHeld(int64_t start, size_t len, bool held) {
+    PhysicalMemoryPool::Instance().SetHeld(static_cast<uint64_t>(start), len, held);
+}
+
+bool DirectMemoryFindVisible(int64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType) {
+    return PhysicalMemoryPool::Instance().FindVisible(static_cast<uint64_t>(offset), findNext, start, end, memoryType);
 }
 
 void DirectMemoryFree(int64_t start, size_t len) {

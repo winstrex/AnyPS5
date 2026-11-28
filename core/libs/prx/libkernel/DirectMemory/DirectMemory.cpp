@@ -5,9 +5,14 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #include <cerrno>
 #include <iterator>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <optional>
 #include <cstdarg>
@@ -15,7 +20,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <thread>
 #include <new>
 #include <limits>
 #include <stdexcept>
@@ -227,6 +235,7 @@ namespace {
 constexpr int GuestMapFixedFlag = 0x10;
 constexpr int GuestProtGpuWrite = 0x20;
 constexpr int GuestProtGpuReadWrite = 0x30;
+constexpr int GuestProtCpuWrite = 0x2;
 constexpr int GuestProtCpuExecute = 0x4;
 
 bool RegistersGpu(int prot, bool zero) {
@@ -1353,7 +1362,7 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
     return flags | GuestMapFixedFlag;
 }
 
-int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+int DoMapDirectReal(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     ValidateAlignment(alignment);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
@@ -1391,7 +1400,12 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     return 0;
 }
 
+int DoMunmapReal(void* addr, size_t len);
+int DoReserveVirtualReal(void** addr, size_t len, int flags, size_t alignment);
+void PhantomRealizeOverlapping(std::uintptr_t begin, std::uintptr_t end);
+
 static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive, bool zero) {
+    if (*addr != nullptr) PhantomRealizeOverlapping(reinterpret_cast<std::uintptr_t>(*addr), reinterpret_cast<std::uintptr_t>(*addr) + len);
     GuestAllocations::Mutation mutation;
     if (exclusive && mutation.Overlaps(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     flags = PlaceHintInReservation(*addr, len, flags);
@@ -1508,6 +1522,7 @@ int DoMapZero(void** addr, size_t len, int prot, int flags) {
 
 int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, int descriptor, std::uint64_t offset, size_t alignment) {
     ValidateOutput(addr);
+    if (*addr != nullptr) PhantomRealizeOverlapping(reinterpret_cast<std::uintptr_t>(*addr), reinterpret_cast<std::uintptr_t>(*addr) + len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || (offset & (PS5_PAGE_SIZE - 1)) != 0 || len > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) || offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - len) return SCE_KERNEL_ERROR_EINVAL;
 #if defined(__linux__) || defined(__APPLE__)
     const bool shared = (flags & 3) == 1;
@@ -1605,6 +1620,7 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
 
 int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
     ValidateOutput(addr);
+    if (*addr != nullptr) PhantomRealizeOverlapping(reinterpret_cast<std::uintptr_t>(*addr), reinterpret_cast<std::uintptr_t>(*addr) + len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     const auto nativeProtection = LinuxProtFromSce(prot);
     GuestAllocations::Mutation mutation;
@@ -1697,6 +1713,7 @@ static int FindImagesOverlapping(dl_phdr_info* image, std::size_t, void* data) {
 #endif
 
 int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) {
+    PhantomRealizeOverlapping(reinterpret_cast<std::uintptr_t>(addr), reinterpret_cast<std::uintptr_t>(addr) + len);
     Trace("protect %p+0x%zx prot=0x%x", addr, len, prot);
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
     constexpr auto pageMask = static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
@@ -1828,7 +1845,7 @@ int DoMtypeprotect(const void* addr, size_t len, int type, int prot, bool requir
     return result;
 }
 
-int DoMunmap(void* addr, size_t len) {
+int DoMunmapReal(void* addr, size_t len) {
     Trace("unmap %p+0x%zx", addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
@@ -1837,7 +1854,7 @@ int DoMunmap(void* addr, size_t len) {
     return 0;
 }
 
-int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
+int DoReserveVirtualReal(void** addr, size_t len, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
@@ -1882,6 +1899,490 @@ int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     RecordReservation(mapped, len);
     Trace("reserve %p+0x%zx flags=0x%x align=0x%zx", mapped, len, flags, alignment);
     return 0;
+}
+
+void ZeroStreaming(void* destination, std::size_t bytes);
+void ZeroWrittenPages(void* destination, std::size_t bytes);
+void PhantomReleasePhysicalReal(std::int64_t start, std::size_t len);
+void DirectMemorySetHeld(int64_t start, size_t len, bool held);
+
+namespace {
+
+enum class RecordState { Reserved, Mapped, Hidden, Free };
+
+struct ZeroTask {
+    void* view = nullptr;
+    std::size_t bytes = 0;
+    std::atomic<int> state{0};
+    std::mutex mutex;
+    std::condition_variable done;
+};
+
+class BackgroundZero {
+public:
+    static BackgroundZero& Get() {
+        static auto* value = new BackgroundZero();
+        return *value;
+    }
+    void Queue(const std::shared_ptr<ZeroTask>& task) {
+        task->state.store(1, std::memory_order_release);
+        {
+            std::lock_guard lock(mutex);
+            tasks.push_back(task);
+        }
+        wake.notify_one();
+    }
+    static bool Cancel(ZeroTask& task) {
+        int queued = 1;
+        if (task.state.compare_exchange_strong(queued, 0, std::memory_order_acq_rel)) return true;
+        Wait(task);
+        return task.state.load(std::memory_order_acquire) != 3;
+    }
+    static void Wait(ZeroTask& task) {
+        if (task.state.load(std::memory_order_acquire) != 2) return;
+        std::unique_lock lock(task.mutex);
+        task.done.wait(lock, [&] { return task.state.load(std::memory_order_acquire) != 2; });
+    }
+
+private:
+    BackgroundZero() {
+        std::thread([this] { run(); }).detach();
+    }
+    void run() {
+        for (;;) {
+            std::shared_ptr<ZeroTask> task;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return !tasks.empty(); });
+                task = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            int queued = 1;
+            if (!task->state.compare_exchange_strong(queued, 2, std::memory_order_acq_rel)) continue;
+            ZeroWrittenPages(task->view, task->bytes);
+            {
+                std::lock_guard lock(task->mutex);
+                task->state.store(3, std::memory_order_release);
+            }
+            task->done.notify_all();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<std::shared_ptr<ZeroTask>> tasks;
+};
+
+struct Record {
+    std::shared_ptr<ZeroTask> zero;
+    std::size_t reserveLength = 0;
+    std::size_t mapLength = 0;
+    std::int64_t physical = -1;
+    int protection = 0;
+    RecordState state = RecordState::Reserved;
+    std::uint64_t stamp = 0;
+    bool physReleased = false;
+    std::size_t hiddenLength = 0;
+};
+
+struct PhantomTable {
+    std::recursive_mutex mutex;
+    std::map<std::uintptr_t, Record> records;
+    std::uint64_t stamp = 0;
+    std::uintptr_t lastTaken = 0;
+    std::uint64_t hidden = 0, kept = 0, reusedReserve = 0, reusedMap = 0, realized = 0, freeCount = 0;
+};
+
+PhantomTable& phantomTable() {
+    static auto* value = new PhantomTable;
+    return *value;
+}
+
+bool phantomsOn() {
+    static const bool on = std::getenv("APS5_NO_PHANTOM_MAPPINGS") == nullptr;
+    return on;
+}
+void realizeRecord(PhantomTable& table, std::map<std::uintptr_t, Record>::iterator it) {
+    auto& record = it->second;
+    void* target = reinterpret_cast<void*>(it->first);
+    if (record.zero != nullptr) {
+        BackgroundZero::Cancel(*record.zero);
+        record.zero.reset();
+    }
+    if (record.state == RecordState::Hidden || record.state == RecordState::Free) {
+        ++table.realized;
+        if (record.mapLength != 0) DoReserveVirtualReal(&target, record.mapLength, GuestMapFixedFlag, 0);
+        const bool physReleased = record.physReleased;
+        const auto physical = record.physical;
+        const auto mapLength = record.mapLength;
+        record.physReleased = false;
+        if (physReleased) DirectMemorySetHeld(physical, mapLength, false);
+        if (record.state == RecordState::Free) {
+            --table.freeCount;
+            DoMunmapReal(target, record.reserveLength);
+            table.records.erase(it);
+            if (physReleased) PhantomReleasePhysicalReal(physical, mapLength);
+            return;
+        }
+        record.state = RecordState::Reserved;
+        record.mapLength = 0;
+        if (physReleased) PhantomReleasePhysicalReal(physical, mapLength);
+    }
+}
+std::size_t differingLength(const Record& record) {
+    return record.state == RecordState::Hidden ? record.hiddenLength : record.reserveLength;
+}
+
+void realizeAll(PhantomTable& table) {
+    for (auto it = table.records.begin(); it != table.records.end();) {
+        auto next = std::next(it);
+        if (it->second.state == RecordState::Hidden || it->second.state == RecordState::Free) realizeRecord(table, it);
+        it = next;
+    }
+}
+
+}
+
+void PhantomRealizeOverlapping(std::uintptr_t begin, std::uintptr_t end) {
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    auto it = table.records.upper_bound(begin);
+    if (it != table.records.begin()) --it;
+    while (it != table.records.end() && it->first < end) {
+        auto next = std::next(it);
+        if (it->first + it->second.reserveLength > begin) {
+            if (it->second.state == RecordState::Hidden || it->second.state == RecordState::Free) {
+                if (it->first + differingLength(it->second) > begin) realizeRecord(table, it);
+            } else {
+                table.records.erase(it);
+            }
+        }
+        it = next;
+    }
+}
+
+void PhantomRealizePhysical(std::int64_t start, std::size_t len) {
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    const auto first = static_cast<std::uint64_t>(start);
+    const auto last = first + len;
+    for (auto it = table.records.begin(); it != table.records.end();) {
+        auto next = std::next(it);
+        const auto& record = it->second;
+        if ((record.state == RecordState::Hidden || record.state == RecordState::Free) && record.physical >= 0 && static_cast<std::uint64_t>(record.physical) < last && first < static_cast<std::uint64_t>(record.physical) + record.mapLength) realizeRecord(table, it);
+        it = next;
+    }
+}
+
+bool PhantomKeepRelease(std::int64_t start, std::size_t len) {
+    if (!phantomsOn()) return false;
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    for (auto& [address, record] : table.records) {
+        if ((record.state == RecordState::Hidden || record.state == RecordState::Free) && !record.physReleased && record.physical == start && record.mapLength == len) {
+            record.physReleased = true;
+            DirectMemorySetHeld(start, len, true);
+            if ((record.state == RecordState::Hidden || record.state == RecordState::Free) && (record.protection & GuestProtCpuWrite) != 0) {
+                record.zero = std::make_shared<ZeroTask>();
+                record.zero->view = reinterpret_cast<void*>(address);
+                record.zero->bytes = record.mapLength;
+                BackgroundZero::Get().Queue(record.zero);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void ZeroStreaming(void* destination, std::size_t bytes) {
+#if defined(__x86_64__) || defined(_M_X64)
+    if ((reinterpret_cast<std::uintptr_t>(destination) & 63u) == 0 && (bytes & 63u) == 0) {
+        auto* cursor = static_cast<__m128i*>(destination);
+        const auto zero = _mm_setzero_si128();
+        for (std::size_t i = 0; i < bytes / sizeof(__m128i); i += 4) {
+            _mm_stream_si128(cursor + i, zero);
+            _mm_stream_si128(cursor + i + 1, zero);
+            _mm_stream_si128(cursor + i + 2, zero);
+            _mm_stream_si128(cursor + i + 3, zero);
+        }
+        _mm_sfence();
+        return;
+    }
+#endif
+    std::memset(destination, 0, bytes);
+}
+
+namespace {
+
+bool PageZero(const void* page) {
+#if defined(__x86_64__) || defined(_M_X64)
+    const auto* cursor = static_cast<const __m128i*>(page);
+    for (std::size_t line = 0; line < 4096; line += 64) _mm_prefetch(static_cast<const char*>(page) + line, _MM_HINT_NTA);
+
+    for (std::size_t i = 0; i < 4096 / sizeof(__m128i); i += 4) {
+        const auto any = _mm_or_si128(_mm_or_si128(_mm_load_si128(cursor + i), _mm_load_si128(cursor + i + 1)), _mm_or_si128(_mm_load_si128(cursor + i + 2), _mm_load_si128(cursor + i + 3)));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(any, _mm_setzero_si128())) != 0xFFFF) return false;
+    }
+    return true;
+#else
+    const auto* bytes = static_cast<const unsigned char*>(page);
+    return std::all_of(bytes, bytes + 4096, [](unsigned char value) { return value == 0; });
+#endif
+}
+
+}
+
+void ZeroWrittenPages(void* destination, std::size_t bytes) {
+    if ((reinterpret_cast<std::uintptr_t>(destination) & 4095u) != 0 || (bytes & 4095u) != 0) {
+        const GuestArena::HostWrite zero(destination, bytes);
+        ZeroStreaming(destination, bytes);
+        return;
+    }
+    auto* base = static_cast<std::byte*>(destination);
+    const auto pages = bytes / 4096;
+#ifdef _WIN32
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> known;
+    const auto start = reinterpret_cast<std::uintptr_t>(destination);
+    GuestArena::GuestArenaKnownZeroTrustingImports_nid_no_patch(start, bytes, [](void* context, std::uintptr_t begin, std::uintptr_t end) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(context)->emplace_back(begin, end); }, &known);
+    auto cursor = start;
+    std::uintptr_t markStart = 0, markEnd = 0;
+    const auto flushMark = [&] {
+        if (markEnd > markStart) GuestArena::GuestArenaMarkKnownZero_nid_no_patch(markStart, markEnd - markStart);
+        markStart = markEnd = 0;
+    };
+    const auto settleUpTo = [&](std::uintptr_t stop) {
+        while (cursor < stop) {
+            if (PageZero(reinterpret_cast<const void*>(cursor))) {
+                if (markEnd != cursor) {
+                    flushMark();
+                    markStart = cursor;
+                }
+                markEnd = cursor + 4096;
+                cursor += 4096;
+                continue;
+            }
+            auto runEnd = cursor + 4096;
+            while (runEnd < stop && !PageZero(reinterpret_cast<const void*>(runEnd))) runEnd += 4096;
+            {
+                const GuestArena::HostWrite zero(reinterpret_cast<void*>(cursor), runEnd - cursor);
+                ZeroStreaming(reinterpret_cast<void*>(cursor), runEnd - cursor);
+            }
+            cursor = runEnd;
+        }
+    };
+    for (const auto& [begin, end] : known) {
+        settleUpTo(begin);
+        cursor = std::max(cursor, end);
+    }
+    settleUpTo(start + bytes);
+    flushMark();
+    return;
+#endif
+    for (std::size_t page = 0; page < pages;) {
+        if (PageZero(base + page * 4096)) {
+            ++page;
+            continue;
+        }
+        auto run = page + 1;
+        while (run < pages && !PageZero(base + run * 4096)) ++run;
+        {
+            const GuestArena::HostWrite zero(base + page * 4096, (run - page) * 4096);
+            ZeroStreaming(base + page * 4096, (run - page) * 4096);
+        }
+        page = run;
+    }
+}
+
+bool PhantomTakeAllocation(std::int64_t searchStart, std::int64_t searchEnd, std::size_t len, std::size_t alignment, int memoryType, std::int64_t* physical) {
+    if (!phantomsOn()) return false;
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    auto exact = table.records.end();
+    for (auto it = table.records.begin(); it != table.records.end(); ++it) {
+        const auto& record = it->second;
+        if (!record.physReleased || record.mapLength != len || record.state != RecordState::Hidden || (record.protection & GuestProtCpuWrite) == 0) continue;
+        if (record.physical < searchStart || record.physical + static_cast<std::int64_t>(len) > searchEnd) continue;
+        if (alignment > 1 && record.physical % static_cast<std::int64_t>(alignment) != 0) continue;
+        if (exact == table.records.end() || record.physical < exact->second.physical) exact = it;
+    }
+    if (exact != table.records.end()) {
+        auto& record = exact->second;
+        void* view = reinterpret_cast<void*>(exact->first);
+        const bool zeroedAhead = record.zero != nullptr && !BackgroundZero::Cancel(*record.zero);
+        record.zero.reset();
+        if (!zeroedAhead) ZeroWrittenPages(view, len);
+        DirectMemoryRetype(record.physical, len, memoryType);
+        DirectMemorySetHeld(record.physical, len, false);
+        record.physReleased = false;
+        table.lastTaken = exact->first;
+        *physical = record.physical;
+        return true;
+    }
+    return false;
+}
+
+
+bool PhantomQueryHidden(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end) {
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    auto it = table.records.upper_bound(address);
+    if (it == table.records.begin()) return false;
+    --it;
+    if (it->second.state != RecordState::Hidden || address >= it->first + it->second.hiddenLength) return false;
+    std::uintptr_t realStart = 0, realEnd = 0;
+    if (GuestReservation(address, &realStart, &realEnd)) {
+        *start = realStart;
+        *end = realEnd;
+        return true;
+    }
+    *start = it->first;
+    *end = it->first + it->second.hiddenLength;
+    return true;
+}
+
+bool PhantomRealizeQuery(std::uintptr_t begin, std::uintptr_t end) {
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    bool any = false;
+    auto it = table.records.upper_bound(begin);
+    if (it != table.records.begin()) --it;
+    while (it != table.records.end() && it->first < end) {
+        auto next = std::next(it);
+        if (it->first + differingLength(it->second) > begin && (it->second.state == RecordState::Hidden || it->second.state == RecordState::Free)) {
+            realizeRecord(table, it);
+            any = true;
+        }
+        it = next;
+    }
+    return any;
+}
+
+void PhantomRealizeAllForAllocation() {
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    realizeAll(table);
+}
+
+void PhantomRealizeAll() {
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    realizeAll(table);
+}
+
+int DoMunmap(void* addr, size_t len) {
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    if (!phantomsOn()) {
+        realizeAll(table);
+        table.records.erase(address);
+        return DoMunmapReal(addr, len);
+    }
+    const auto found = table.records.find(address);
+    if (found != table.records.end() && found->second.reserveLength == len && found->second.state == RecordState::Hidden) {
+        found->second.state = RecordState::Free;
+        found->second.stamp = ++table.stamp;
+        ++table.kept;
+        ++table.freeCount;
+        if (table.freeCount > 64) {
+            auto oldest = table.records.end();
+            for (auto it = table.records.begin(); it != table.records.end(); ++it) {
+                if (it->second.state == RecordState::Free && (oldest == table.records.end() || it->second.stamp < oldest->second.stamp)) oldest = it;
+            }
+            if (oldest != table.records.end()) realizeRecord(table, oldest);
+        }
+        return 0;
+    }
+    PhantomRealizeOverlapping(address, address + len);
+    table.records.erase(address);
+    return DoMunmapReal(addr, len);
+}
+
+int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
+    if (addr == nullptr) return DoReserveVirtualReal(addr, len, flags, alignment);
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    const bool on = phantomsOn();
+    if (!on) realizeAll(table);
+    const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
+    if (fixed) {
+        const auto address = reinterpret_cast<std::uintptr_t>(*addr);
+        const auto found = table.records.find(address);
+        if (on && found != table.records.end() && found->second.state == RecordState::Mapped && len == found->second.mapLength) {
+            found->second.state = RecordState::Hidden;
+            found->second.hiddenLength = len;
+            ++table.hidden;
+            return 0;
+        }
+        PhantomRealizeOverlapping(address, address + len);
+        return DoReserveVirtualReal(addr, len, flags, alignment);
+    }
+    if (on && *addr == nullptr) {
+        const auto taken = table.records.find(table.lastTaken);
+        if (taken != table.records.end() && taken->second.state == RecordState::Free && taken->second.reserveLength == len && (alignment <= 1 || taken->first % alignment == 0)) {
+            taken->second.state = RecordState::Hidden;
+            --table.freeCount;
+            ++table.reusedReserve;
+            table.lastTaken = 0;
+            *addr = reinterpret_cast<void*>(taken->first);
+            return 0;
+        }
+        for (auto it = table.records.begin(); it != table.records.end(); ++it) {
+            auto& record = it->second;
+            if (record.state != RecordState::Free || record.reserveLength != len) continue;
+            if (alignment > 1 && it->first % alignment != 0) continue;
+            record.state = RecordState::Hidden;
+            --table.freeCount;
+            ++table.reusedReserve;
+            *addr = reinterpret_cast<void*>(it->first);
+            return 0;
+        }
+    }
+    const int result = DoReserveVirtualReal(addr, len, flags, alignment);
+    if (result == 0 && *addr != nullptr) {
+        Record record;
+        record.reserveLength = len;
+        table.records[reinterpret_cast<std::uintptr_t>(*addr)] = record;
+    }
+    return result;
+}
+
+int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+    if (addr == nullptr) return DoMapDirectReal(addr, len, prot, flags, physStart, alignment);
+    auto& table = phantomTable();
+    std::lock_guard lock(table.mutex);
+    for (auto it = table.records.begin(); it != table.records.end();) {
+        auto next = std::next(it);
+        const auto& record = it->second;
+        if (record.physReleased && record.physical < physStart + static_cast<std::int64_t>(len) && record.physical + static_cast<std::int64_t>(record.mapLength) > physStart) realizeRecord(table, it);
+        it = next;
+    }
+    const bool on = phantomsOn();
+    if (!on) realizeAll(table);
+    const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
+    if (fixed) {
+        const auto address = reinterpret_cast<std::uintptr_t>(*addr);
+        const auto found = table.records.find(address);
+        if (found != table.records.end()) {
+            auto& record = found->second;
+            if (on && record.state == RecordState::Hidden && !record.physReleased && record.mapLength == len && record.physical == physStart && record.protection == prot) {
+                record.state = RecordState::Mapped;
+                ++table.reusedMap;
+                return 0;
+            }
+            if (record.state == RecordState::Hidden) realizeRecord(table, found);
+            const int result = DoMapDirectReal(addr, len, prot, flags, physStart, alignment);
+            auto again = table.records.find(address);
+            if (result == 0 && again != table.records.end() && len <= again->second.reserveLength) {
+                again->second.state = RecordState::Mapped;
+                again->second.mapLength = len;
+                again->second.physical = physStart;
+                again->second.protection = prot;
+            }
+            return result;
+        }
+        PhantomRealizeOverlapping(address, address + len);
+    }
+    return DoMapDirectReal(addr, len, prot, flags, physStart, alignment);
 }
 
 void CreateDirectMemoryBacking(int64_t start, size_t len) {

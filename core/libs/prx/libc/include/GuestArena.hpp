@@ -79,6 +79,8 @@ void GuestArenaCompareResidentWhenShared_nid_no_patch(std::uintptr_t address, st
 void GuestArenaComparedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);
 void GuestArenaTakeUnreportedPages_nid_no_patch(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count);
 void GuestArenaKnownZero_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
+void GuestArenaMarkKnownZero_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaKnownZeroTrustingImports_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
 void GuestArenaForgetKnownZero_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 std::uint64_t GuestArenaKnownZeroMarks_nid_no_patch();
 void GuestArenaForgetSection_nid_postfix(void* section);

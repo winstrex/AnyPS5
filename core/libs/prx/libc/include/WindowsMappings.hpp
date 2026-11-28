@@ -589,6 +589,22 @@ public:
         return true;
     }
 
+    void MarkKnownZero(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
+        std::lock_guard lock(mutex);
+        const auto end = address + bytes;
+        for (auto cursor = address; cursor < end;) {
+            const auto limit = zeroSpanEnd(cursor, true);
+            if (limit == 0) {
+                cursor = std::min(end, (cursor & ~(pageBytes - 1)) + pageBytes);
+                continue;
+            }
+            const auto stop = std::min(end, limit);
+            markZero(cursor, stop);
+            cursor = stop;
+        }
+    }
+
     void ForgetKnownZero(std::uintptr_t address, std::size_t bytes) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
         std::lock_guard lock(mutex);
@@ -599,7 +615,7 @@ public:
         return zeroMarks.load(std::memory_order_acquire);
     }
 
-    void KnownZero(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
+    void KnownZero(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context, bool trustImported = false) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
         const auto end = address + bytes;
         std::uintptr_t reportStart = 0;
@@ -634,7 +650,7 @@ public:
                 continue;
             }
             while (cursor < chunkEnd) {
-                const auto limit = zeroSpanEnd(cursor);
+                const auto limit = zeroSpanEnd(cursor, trustImported);
                 const auto stop = limit == 0 ? std::min(chunkEnd, (cursor & ~(pageBytes - 1)) + pageBytes) : std::min(chunkEnd, limit);
                 if (limit == 0) forgetZero(cursor, stop);
                 else harvestZero(cursor, stop);
@@ -1070,11 +1086,11 @@ private:
         return true;
     }
 
-    std::uintptr_t zeroSpanEnd(std::uintptr_t at) {
+    std::uintptr_t zeroSpanEnd(std::uintptr_t at, bool trustImported = false) {
         const auto run = residentRuns.upper_bound(at);
         if (run != residentRuns.begin() && std::prev(run)->second.end > at) {
             const auto& resident = std::prev(run)->second;
-            return resident.watched && !resident.imported ? resident.end : 0;
+            return resident.watched && (trustImported || !resident.imported) ? resident.end : 0;
         }
         if (views.find(at & ~(pageBytes - 1)) != views.end()) return 0;
         return privateAllocationEnd(at);

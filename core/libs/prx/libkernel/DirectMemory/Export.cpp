@@ -44,6 +44,14 @@
 #include <utility>
 #include <vector>
 
+void PhantomRealizeAll();
+bool PhantomRealizeQuery(std::uintptr_t begin, std::uintptr_t end);
+bool PhantomQueryHidden(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end);
+void PhantomRealizeAllForAllocation();
+void PhantomRealizePhysical(std::int64_t start, std::size_t len);
+bool DirectMemoryFindVisible(int64_t offset, bool findNext, int64_t* start, int64_t* end, int* memoryType);
+bool PhantomKeepRelease(std::int64_t start, std::size_t len);
+bool PhantomTakeAllocation(std::int64_t searchStart, std::int64_t searchEnd, std::size_t len, std::size_t alignment, int memoryType, std::int64_t* physical);
 extern "C" std::uint64_t GuestImageSegmentBytes_nid_no_patch();
 
 namespace {
@@ -191,6 +199,14 @@ void ReleaseClaimedDirectMemory(int64_t start, size_t len) {
  DirectMemoryFinishRelease(start, len);
 }
 
+}
+
+void PhantomReleasePhysicalReal(std::int64_t start, std::size_t len) {
+    if (DirectMemoryClaimRelease(start, len, false)) ReleaseClaimedDirectMemory(start, len);
+}
+
+namespace {
+
 std::mutex g_prtLock;
 PrtAperture g_prtApertures[PRT_APERTURE_COUNT] = {};
 
@@ -318,7 +334,16 @@ int APS5_VABI sceKernelAllocateDirectMemory(int64_t search_start, int64_t search
   || (alignment != 0 && (alignment & (PS5_PAGE_SIZE - 1))))
   return SCE_KERNEL_ERROR_EINVAL;
  int64_t physical = 0;
- const int result = DirectMemoryAlloc(search_start, std::min<int64_t>(search_end, static_cast<int64_t>(DirectMemorySize())), len, alignment, memory_type, &physical);
+ if (PhantomTakeAllocation(search_start, std::min<int64_t>(search_end, static_cast<int64_t>(DirectMemorySize())), len, alignment, memory_type, &physical)) {
+  if (GuestCopyOut_nid_no_patch(phys_addr_out, &physical, sizeof(physical))) return 0;
+  PhantomKeepRelease(physical, len);
+  return SCE_KERNEL_ERROR_EFAULT;
+ }
+ int result = DirectMemoryAlloc(search_start, std::min<int64_t>(search_end, static_cast<int64_t>(DirectMemorySize())), len, alignment, memory_type, &physical);
+ if (result != 0) {
+  PhantomRealizeAllForAllocation();
+  result = DirectMemoryAlloc(search_start, std::min<int64_t>(search_end, static_cast<int64_t>(DirectMemorySize())), len, alignment, memory_type, &physical);
+ }
  if (result != 0) return result;
  if (GuestCopyOut_nid_no_patch(phys_addr_out, &physical, sizeof(physical))) return 0;
  DirectMemoryFree(physical, len);
@@ -351,7 +376,7 @@ int APS5_VABI sceKernelDirectMemoryQuery(int64_t offset, int flags, void* info, 
  if (flags == 2 || flags == 4 || info_size == 0) return SCE_KERNEL_ERROR_EINVAL;
  if ((flags & ~SCE_KERNEL_DMQ_FIND_NEXT) != 0) throw std::runtime_error("sceKernelDirectMemoryQuery: flags other than 0, 1, 2 and 4 are not measured");
  DirectMemoryQueryInfo q{};
- if (!DirectMemoryFind(offset, (flags & SCE_KERNEL_DMQ_FIND_NEXT) != 0, &q.start, &q.end, &q.memory_type)) return SCE_KERNEL_ERROR_EACCES;
+ if (!DirectMemoryFindVisible(offset, (flags & SCE_KERNEL_DMQ_FIND_NEXT) != 0, &q.start, &q.end, &q.memory_type)) return SCE_KERNEL_ERROR_EACCES;
  if (!GuestCopyOut_nid_no_patch(info, &q, std::min(info_size, sizeof(q)))) return SCE_KERNEL_ERROR_EFAULT;
  return 0;
 }
@@ -361,7 +386,7 @@ int APS5_VABI sceKernelGetDirectMemoryType(int64_t offset, int* memory_type, int
  int64_t blockStart = 0;
  int64_t blockEnd = 0;
  int blockType = 0;
- if (!DirectMemoryFind(offset, false, &blockStart, &blockEnd, &blockType)) return SCE_KERNEL_ERROR_ENOENT;
+ if (!DirectMemoryFindVisible(offset, false, &blockStart, &blockEnd, &blockType)) return SCE_KERNEL_ERROR_ENOENT;
  if (!GuestCopyOut_nid_no_patch(memory_type, &blockType, sizeof(blockType))) return SCE_KERNEL_ERROR_EFAULT;
  if (!GuestCopyOut_nid_no_patch(start, &blockStart, sizeof(blockStart))) return SCE_KERNEL_ERROR_EFAULT;
  if (!GuestCopyOut_nid_no_patch(end, &blockEnd, sizeof(blockEnd))) return SCE_KERNEL_ERROR_EFAULT;
@@ -468,6 +493,8 @@ int APS5_VABI sceKernelReleaseFlexibleMemory(void* addr, size_t len) {
 
 int APS5_VABI sceKernelReleaseDirectMemory(int64_t start, size_t len) {
  if (start < 0 || len == 0) return SCE_KERNEL_ERROR_EINVAL;
+ if (PhantomKeepRelease(start, len)) return 0;
+ PhantomRealizePhysical(start, len);
  if ((static_cast<std::uint64_t>(start) & (PS5_PAGE_SIZE - 1)) != 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 ||
      len > DIRECT_MEMORY_SIZE || static_cast<std::uint64_t>(start) > DIRECT_MEMORY_SIZE - len)
      return SCE_KERNEL_ERROR_EINVAL;
@@ -489,6 +516,21 @@ static int QueryVirtualRange(const void* addr, int flags, VirtualQueryInfo* info
  memset(info, 0, sizeof(VirtualQueryInfo));
  const auto address = reinterpret_cast<uintptr_t>(addr);
  constexpr int findNext = 1;
+ {
+  std::uintptr_t hiddenStart = 0, hiddenEnd = 0;
+  if (PhantomQueryHidden(address, &hiddenStart, &hiddenEnd)) {
+   info->start = hiddenStart;
+   info->end = hiddenEnd;
+   return 0;
+  }
+ }
+ PhantomRealizeQuery(address, address + 1);
+ if ((flags & findNext) != 0) {
+  for (int round = 0; round < 64; ++round) {
+   const auto next = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, true);
+   if (next == nullptr || !PhantomRealizeQuery(next->address, next->address + next->bytes)) break;
+  }
+ }
  std::uintptr_t reservedStart = 0;
  std::uintptr_t reservedEnd = 0;
  if (GuestReservation(address, &reservedStart, &reservedEnd)) {
@@ -599,6 +641,8 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
 // ---------------------------------------------------------------------------
 
 int APS5_VABI sceKernelCheckedReleaseDirectMemory(int64_t start, size_t len) {
+ if (PhantomKeepRelease(start, len)) return 0;
+ PhantomRealizePhysical(start, len);
  if (start < 0 || (static_cast<uint64_t>(start) & (PS5_PAGE_SIZE - 1)) != 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
  if (len == 0) return 0;
  if (!DirectMemoryClaimRelease(start, len, true)) return SCE_KERNEL_ERROR_ENOENT;
